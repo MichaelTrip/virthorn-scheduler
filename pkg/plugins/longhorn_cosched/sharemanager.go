@@ -21,6 +21,15 @@ var longhornVolumeGVR = schema.GroupVersionResource{
 	Resource: "volumes",
 }
 
+// longhornReplicaGVR is the GroupVersionResource for the Longhorn Replica CRD.
+// Each replica object carries spec.nodeID — the node that holds that replica.
+// Used during cold start (Volume spec.nodeID="") to predict the attachment node.
+var longhornReplicaGVR = schema.GroupVersionResource{
+	Group:    "longhorn.io",
+	Version:  "v1beta2",
+	Resource: "replicas",
+}
+
 // findShareManagerNode looks up the node where the Longhorn share-manager for
 // any of the RWX PVCs referenced by the given pod will run.
 //
@@ -151,17 +160,16 @@ func getShareManagerNodeForPVC(ctx context.Context, clientset kubernetes.Interfa
 // getLonghornVolumeNode reads the Longhorn Volume CRD for the given PV name
 // and returns the node where the volume engine will run (or is running).
 //
-// Resolution priority within this CRD:
+// Resolution priority:
 //  1. spec.nodeID        — set by Longhorn when the volume has been attached before;
-//     Longhorn re-attaches to this node on the next use.
+//     Longhorn always re-attaches to this node. Authoritative for warm restarts.
 //  2. status.currentNodeID — the node the engine is currently attached to
-//     (same value as spec.nodeID when attached).
-//  3. status.ownerID     — the Longhorn manager node responsible for this volume.
-//     When the volume is detached and has never been attached
-//     (spec.nodeID=""), the owning manager schedules the attach
-//     and picks a node with a healthy replica. In practice the
-//     manager attaches the volume to a node close to itself,
-//     which is where the share-manager pod will run.
+//     (identical to spec.nodeID when attached; belt-and-suspenders fallback).
+//  3. Cold-start replica heuristic — when spec.nodeID and currentNodeID are both
+//     empty (volume was never attached), Longhorn's volume controller will attach
+//     the engine to a replica node that is NOT the status.ownerID node. We query
+//     the Replica CRDs to find such a node and use it as a scheduling hint.
+//     See getAttachmentNodeFromReplicas() for the empirically derived algorithm.
 func getLonghornVolumeNode(ctx context.Context, dynClient dynamic.Interface, pvName string) (string, error) {
 	obj, err := dynClient.Resource(longhornVolumeGVR).Namespace(LonghornNamespace).Get(ctx, pvName, metav1.GetOptions{})
 	if err != nil {
@@ -211,22 +219,90 @@ func getLonghornVolumeNode(ctx context.Context, dynClient dynamic.Interface, pvN
 		return currentNodeID, nil
 	}
 
-	// spec.nodeID and currentNodeID are both empty: the volume has never been
-	// attached (cold start). Do NOT fall back to status.ownerID — that field
-	// reflects the Longhorn controller manager node (which longhorn-manager
-	// pod owns this Volume object), not the node where the engine will attach.
-	// Using it as a predictor causes the virt-launcher to be pinned to the
-	// wrong node.
-	//
-	// Cold-start co-location is handled by the PostBind extension point instead:
-	// after the virt-launcher is bound to a node, PostBind writes that node into
-	// spec.nodeID so Longhorn attaches the engine (and share-manager) there.
-	klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: spec.nodeID and currentNodeID are empty (cold start), returning empty — PostBind will pin the volume",
+	// 3. Cold-start heuristic: both spec.nodeID and currentNodeID are empty,
+	//    meaning the volume has never been attached (or was fully detached with
+	//    spec.nodeID cleared). Longhorn will attach the engine to a replica node
+	//    that is NOT the ownerID node. Query replicas to predict the target.
+	if ownerID != "" {
+		node, err := getAttachmentNodeFromReplicas(ctx, dynClient, pvName, ownerID)
+		if err != nil {
+			klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: replica lookup failed, returning empty",
+				"pvName", pvName,
+				"ownerID", ownerID,
+				"error", err,
+			)
+			return "", nil
+		}
+		if node != "" {
+			klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: cold-start — predicted attachment node from replicas",
+				"pvName", pvName,
+				"ownerID", ownerID,
+				"predictedNode", node,
+				"status.state", volumeState,
+			)
+			return node, nil
+		}
+	}
+
+	klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: no node assignment found (cold start, no usable replicas)",
 		"pvName", pvName,
 		"status.ownerID", ownerID,
 		"status.state", volumeState,
 	)
 	return "", nil
+}
+
+// getAttachmentNodeFromReplicas predicts the node where Longhorn will attach
+// the volume engine when the volume is in a detached cold-start state
+// (Volume spec.nodeID="", status.currentNodeID="").
+//
+// Empirically observed behaviour (Longhorn v1.11, 2-replica RWX volume):
+// The volume controller places the engine on a replica node that is NOT the
+// status.ownerID node. The ownerID node is the longhorn-manager that "owns"
+// this Volume object in the controller ring; it delegates the engine process
+// to a peer node that holds a healthy replica.
+//
+// This function returns the first healthy replica node that differs from
+// ownerID. If all replicas are on the ownerID node (single-node cluster or
+// all replicas migrated), it falls back to any healthy replica node.
+func getAttachmentNodeFromReplicas(ctx context.Context, dynClient dynamic.Interface, pvName, ownerID string) (string, error) {
+	list, err := dynClient.Resource(longhornReplicaGVR).Namespace(LonghornNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("longhornvolume=%s", pvName),
+	})
+	if err != nil {
+		return "", fmt.Errorf("listing replicas for volume %q: %w", pvName, err)
+	}
+
+	var fallback string // any healthy replica node (used if all are on ownerID)
+	for _, item := range list.Items {
+		spec, _ := item.Object["spec"].(map[string]interface{})
+		status, _ := item.Object["status"].(map[string]interface{})
+		if spec == nil || status == nil {
+			continue
+		}
+
+		replicaNode, _ := spec["nodeID"].(string)
+		currentState, _ := status["currentState"].(string)
+		failedAt, _ := spec["failedAt"].(string)
+
+		// Only consider healthy (running) replicas that have not failed.
+		if replicaNode == "" || currentState != "running" || failedAt != "" {
+			continue
+		}
+
+		if fallback == "" {
+			fallback = replicaNode
+		}
+
+		if replicaNode != ownerID {
+			// Preferred: a healthy replica on a node other than the owner.
+			return replicaNode, nil
+		}
+	}
+
+	// If every healthy replica is on the ownerID node, return the fallback.
+	// This handles single-node clusters or unusual replica distributions.
+	return fallback, nil
 }
 
 // getShareManagerNodeFromPod looks up the share-manager pod for a PV and

@@ -1,13 +1,11 @@
 ---
 # ConfigMap holding the KubeSchedulerConfiguration for virthorn-scheduler.
-# This registers the LonghornCoSchedule plugin at the Filter, Score, and
-# PreBind extension points, alongside all default plugins.
+# This registers the LonghornCoSchedule plugin at the Filter and Score
+# extension points, alongside all default plugins.
 #
-# PreBind is used (not PostBind) because it fires BEFORE the binding API call:
-# kubelet has not yet seen the pod's nodeName, so no VolumeAttachment has been
-# created and Longhorn has not yet decided where to attach the volume engine.
-# Writing spec.nodeID here guarantees Longhorn sees the target node before it
-# processes any VolumeAttachment for the pod.
+# The cold-start co-scheduling is handled purely via the Filter/Score phase
+# by querying Longhorn Replica CRDs to predict the attachment node — no
+# write-back (PreBind/PostBind) is needed.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -28,9 +26,6 @@ data:
             enabled:
               - name: LonghornCoSchedule
           score:
-            enabled:
-              - name: LonghornCoSchedule
-          preBind:
             enabled:
               - name: LonghornCoSchedule
         pluginConfig:

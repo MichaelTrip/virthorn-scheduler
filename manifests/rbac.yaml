@@ -59,18 +59,13 @@ rules:
     verbs: ["get", "list", "watch"]
 
   # --- LonghornCoSchedule plugin permissions ---
-  # Read access for share-manager pod lookup and Longhorn Volume CRD resolution.
+  # Read access for share-manager pod lookup and Longhorn CRD resolution.
+  # replicas.longhorn.io is needed for cold-start attachment node prediction:
+  # the plugin lists replicas for a detached volume to identify which node
+  # Longhorn will attach the engine to (the non-ownerID replica node).
   - apiGroups: ["longhorn.io"]
-    resources: ["sharemanagers"]
+    resources: ["sharemanagers", "volumes", "replicas"]
     verbs: ["get", "list", "watch"]
-  # Read + write access for Longhorn Volume CRD.
-  # patch/update are required by the PostBind extension point, which writes
-  # spec.nodeID into the Volume CRD on cold start (brand-new PVC) so that
-  # Longhorn attaches the volume engine — and thus the share-manager pod —
-  # to the same node as the virt-launcher pod.
-  - apiGroups: ["longhorn.io"]
-    resources: ["volumes"]
-    verbs: ["get", "list", "watch", "patch", "update"]
 
 ---
 # ClusterRoleBinding: bind the ClusterRole to the ServiceAccount
