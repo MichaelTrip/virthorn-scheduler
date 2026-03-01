@@ -181,10 +181,17 @@ func getShareManagerNodeFromCRD(ctx context.Context, dynClient dynamic.Interface
 		return "", nil
 	}
 
-	// Only use the ownerID if the share-manager is in a usable state.
-	// Longhorn states: stopped, starting, running, error
+	// Trust ownerID for all states where Longhorn has committed to a node:
+	//   stopped  — no VM currently using the volume, but ownerID is already
+	//              authoritatively set: Longhorn will start the pod there.
+	//              This is the critical case: VM is being scheduled before the
+	//              share-manager pod exists, but the node assignment is final.
+	//   starting — pod is launching on ownerID node.
+	//   running  — pod is live and serving NFS on ownerID node.
+	//   error    — excluded: Longhorn may migrate to a different node during
+	//              recovery, so ownerID is not yet stable.
 	switch state {
-	case "running", "starting":
+	case "stopped", "starting", "running":
 		return ownerID, nil
 	default:
 		klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeFromCRD: ShareManager CRD state not usable, skipping",
