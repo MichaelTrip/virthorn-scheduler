@@ -12,57 +12,62 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
-// PostBind implements the PostBindPlugin interface.
+// PreBind implements the PreBindPlugin interface.
 //
-// It fires after the virt-launcher pod has been bound to a node. For opted-in
-// pods whose Longhorn Volume CRD has an empty spec.nodeID (i.e. a brand-new
-// volume that has never been attached before — "cold start"), PostBind writes
-// the bound node name into spec.nodeID on the Longhorn Volume CRD.
+// It fires after the scheduler has selected a node but BEFORE the binding API
+// call that assigns nodeName to the pod. This means kubelet has not yet seen
+// the pod, so no VolumeAttachment has been triggered and Longhorn has not yet
+// decided where to attach the volume engine.
 //
-// This solves the cold-start chicken-and-egg problem:
-//   - At Filter/Score time, spec.nodeID is empty → the plugin cannot predict
-//     which node Longhorn will pick, so the VM schedules freely.
-//   - At PostBind time, the node is known → we write it into spec.nodeID so
-//     Longhorn attaches the volume engine (and thus the share-manager) to that
-//     same node.
+// For opted-in pods whose Longhorn Volume CRD has an empty spec.nodeID
+// (brand-new volume, "cold start"), PreBind writes the selected node name into
+// spec.nodeID. Longhorn reads this field when it processes the subsequent
+// VolumeAttachment and attaches the engine — and thus the share-manager pod —
+// to that same node.
 //
-// For warm restarts (spec.nodeID already set by Longhorn from a prior
-// attachment), PostBind is a no-op — the Filter/Score extension points already
-// constrained the pod to the correct node, and we must not overwrite a value
-// that Longhorn manages.
-func (p *Plugin) PostBind(ctx context.Context, _ *framework.CycleState, pod *corev1.Pod, nodeName string) {
+// For warm restarts (spec.nodeID already set by a prior attachment), PreBind
+// is a no-op — Filter/Score already constrained the pod to the correct node.
+//
+// Why PreBind and not PostBind?
+// PostBind fires AFTER the binding is committed: kubelet already knows the
+// pod's nodeName and triggers a VolumeAttachment almost immediately. In
+// testing, Longhorn resolved the attachment (and created the share-manager
+// pod) within ~30ms of binding — faster than PostBind could write spec.nodeID.
+// PreBind executes synchronously before the bind, guaranteeing our write lands
+// before Longhorn processes any VolumeAttachment for the pod.
+func (p *Plugin) PreBind(ctx context.Context, state *framework.CycleState, pod *corev1.Pod, nodeName string) *framework.Status {
 	podKey := klog.KObj(pod)
 
 	if !isOptedIn(pod) {
-		return
+		return nil
 	}
 
 	if isMigrationTarget(pod) {
-		klog.V(4).InfoS("LonghornCoSchedule/PostBind: migration target pod, skipping",
+		klog.V(4).InfoS("LonghornCoSchedule/PreBind: migration target pod, skipping",
 			"pod", podKey,
 			"node", nodeName,
 		)
-		return
+		return nil
 	}
 
 	pvcNames := collectPVCNames(pod)
 	if len(pvcNames) == 0 {
-		return
+		return nil
 	}
 
 	for _, pvcName := range pvcNames {
 		if err := p.pinLonghornVolumeToNode(ctx, pod, pvcName, nodeName); err != nil {
-			// Log but do not fail — PostBind errors cannot be returned to the
-			// scheduler as the binding has already been committed. The worst
-			// case is that the share-manager lands on a different node for
-			// this session (same as the pre-fix behaviour).
-			klog.ErrorS(err, "LonghornCoSchedule/PostBind: failed to pin Longhorn volume to node",
+			klog.ErrorS(err, "LonghornCoSchedule/PreBind: failed to pin Longhorn volume to node",
 				"pod", podKey,
 				"pvcName", pvcName,
 				"node", nodeName,
 			)
+			return framework.NewStatus(framework.Error,
+				fmt.Sprintf("failed to pin Longhorn volume for PVC %q to node %q: %v", pvcName, nodeName, err))
 		}
 	}
+
+	return nil
 }
 
 // pinLonghornVolumeToNode sets spec.nodeID on the Longhorn Volume CRD for the
@@ -74,7 +79,7 @@ func (p *Plugin) pinLonghornVolumeToNode(ctx context.Context, pod *corev1.Pod, p
 	// Resolve PVC → PV name.
 	pvc, err := p.clientset.CoreV1().PersistentVolumeClaims(pod.Namespace).Get(ctx, pvcName, metav1.GetOptions{})
 	if err != nil {
-		klog.V(4).InfoS("LonghornCoSchedule/PostBind: PVC not found, skipping",
+		klog.V(4).InfoS("LonghornCoSchedule/PreBind: PVC not found, skipping",
 			"pod", podKey,
 			"pvcName", pvcName,
 			"error", err,
@@ -88,7 +93,7 @@ func (p *Plugin) pinLonghornVolumeToNode(ctx context.Context, pod *corev1.Pod, p
 
 	pvName := pvc.Spec.VolumeName
 	if pvName == "" {
-		klog.V(4).InfoS("LonghornCoSchedule/PostBind: PVC not yet bound, skipping",
+		klog.V(4).InfoS("LonghornCoSchedule/PreBind: PVC not yet bound, skipping",
 			"pod", podKey,
 			"pvcName", pvcName,
 		)
@@ -98,7 +103,7 @@ func (p *Plugin) pinLonghornVolumeToNode(ctx context.Context, pod *corev1.Pod, p
 	// Read the current Longhorn Volume CRD.
 	volObj, err := p.dynClient.Resource(longhornVolumeGVR).Namespace(LonghornNamespace).Get(ctx, pvName, metav1.GetOptions{})
 	if err != nil {
-		klog.V(4).InfoS("LonghornCoSchedule/PostBind: Longhorn Volume CRD not found, skipping",
+		klog.V(4).InfoS("LonghornCoSchedule/PreBind: Longhorn Volume CRD not found, skipping",
 			"pod", podKey,
 			"pvName", pvName,
 			"error", err,
@@ -115,17 +120,19 @@ func (p *Plugin) pinLonghornVolumeToNode(ctx context.Context, pod *corev1.Pod, p
 	if currentSpecNodeID != "" {
 		// Warm restart — spec.nodeID was already set by a prior attachment.
 		// Filter/Score already handled placement; do not overwrite.
-		klog.V(4).InfoS("LonghornCoSchedule/PostBind: spec.nodeID already set, skipping patch",
+		klog.V(4).InfoS("LonghornCoSchedule/PreBind: spec.nodeID already set, skipping patch",
 			"pod", podKey,
 			"pvName", pvName,
 			"existingNodeID", currentSpecNodeID,
-			"boundNode", nodeName,
+			"selectedNode", nodeName,
 		)
 		return nil
 	}
 
-	// Cold start — spec.nodeID is empty. Patch it to the node the virt-launcher
-	// was just bound to so Longhorn attaches the engine (and share-manager) there.
+	// Cold start — spec.nodeID is empty. Patch it to the node the scheduler
+	// has selected for the virt-launcher so Longhorn attaches the engine (and
+	// share-manager) there. This write happens BEFORE the binding API call,
+	// so Longhorn sees it before any VolumeAttachment is created.
 	patch := map[string]interface{}{
 		"spec": map[string]interface{}{
 			"nodeID": nodeName,
@@ -147,7 +154,7 @@ func (p *Plugin) pinLonghornVolumeToNode(ctx context.Context, pod *corev1.Pod, p
 		return fmt.Errorf("failed to patch Longhorn Volume %q spec.nodeID to %q: %w", pvName, nodeName, err)
 	}
 
-	klog.V(4).InfoS("LonghornCoSchedule/PostBind: patched Longhorn Volume spec.nodeID for cold-start co-location",
+	klog.V(4).InfoS("LonghornCoSchedule/PreBind: patched Longhorn Volume spec.nodeID for cold-start co-location",
 		"pod", podKey,
 		"pvName", pvName,
 		"node", nodeName,
