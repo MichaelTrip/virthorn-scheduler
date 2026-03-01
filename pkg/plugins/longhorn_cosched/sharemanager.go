@@ -21,17 +21,6 @@ var longhornVolumeGVR = schema.GroupVersionResource{
 	Resource: "volumes",
 }
 
-// shareManagerGVR is the GroupVersionResource for the Longhorn ShareManager CRD.
-// Used as a secondary fallback only — its ownerID reflects the Longhorn
-// controller manager node (which longhorn-manager pod controls this object),
-// NOT where the share-manager pod runs. Only the pod lookup from this CRD
-// is meaningful for our purposes.
-var shareManagerGVR = schema.GroupVersionResource{
-	Group:    "longhorn.io",
-	Version:  "v1beta2",
-	Resource: "sharemanagers",
-}
-
 // findShareManagerNode looks up the node where the Longhorn share-manager for
 // any of the RWX PVCs referenced by the given pod will run.
 //
@@ -222,23 +211,19 @@ func getLonghornVolumeNode(ctx context.Context, dynClient dynamic.Interface, pvN
 		return currentNodeID, nil
 	}
 
-	// 3. status.ownerID: Longhorn manager responsible for this volume.
-	//    When the volume is detached (spec.nodeID=""), the owning manager will
-	//    handle the next attach request and tends to attach to a node with a
-	//    replica — in practice the node where the manager itself runs, which
-	//    is the ownerID node. This correctly predicted share-manager placement
-	//    in testing for the "first start / fully detached" scenario.
-	if ownerID != "" {
-		klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: volume detached, using status.ownerID as attachment predictor",
-			"pvName", pvName,
-			"node", ownerID,
-			"status.state", volumeState,
-		)
-		return ownerID, nil
-	}
-
-	klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: no node assignment found in Volume CRD",
+	// spec.nodeID and currentNodeID are both empty: the volume has never been
+	// attached (cold start). Do NOT fall back to status.ownerID — that field
+	// reflects the Longhorn controller manager node (which longhorn-manager
+	// pod owns this Volume object), not the node where the engine will attach.
+	// Using it as a predictor causes the virt-launcher to be pinned to the
+	// wrong node.
+	//
+	// Cold-start co-location is handled by the PostBind extension point instead:
+	// after the virt-launcher is bound to a node, PostBind writes that node into
+	// spec.nodeID so Longhorn attaches the engine (and share-manager) there.
+	klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: spec.nodeID and currentNodeID are empty (cold start), returning empty — PostBind will pin the volume",
 		"pvName", pvName,
+		"status.ownerID", ownerID,
 		"status.state", volumeState,
 	)
 	return "", nil

@@ -49,6 +49,7 @@ type Plugin struct {
 
 var _ framework.FilterPlugin = &Plugin{}
 var _ framework.ScorePlugin = &Plugin{}
+var _ framework.PostBindPlugin = &Plugin{}
 
 // Name returns the name of the plugin.
 func (p *Plugin) Name() string {

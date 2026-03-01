@@ -47,22 +47,40 @@ VM Pod created
   │
   └─ annotation scheduler.virthorn-scheduler.io/co-schedule: "true"
        │
-       ├─ No share-manager found yet
-       │    └─ VM schedules freely on best node
+       ├─ WARM RESTART: Longhorn Volume CRD spec.nodeID = "node-X"
+       │    (volume was attached before — Longhorn persists the node)
+       │    └─ Filter: only node-X passes
+       │       Score: node-X gets score 100
+       │       PostBind: spec.nodeID already set → no-op
+       │       → VM scheduled on node-X ✅ co-located
        │
-       └─ Share-manager assigned to node-X
-            └─ Filter: only node-X passes
-               Score: node-X gets score 100
-               → VM scheduled on node-X (co-located)
+       └─ COLD START: Longhorn Volume CRD spec.nodeID = ""
+            (brand-new PVC, never attached before)
+            └─ Filter/Score: no constraint → VM schedules freely
+               PostBind: WRITES spec.nodeID = bound-node into Volume CRD
+               → Longhorn attaches engine to bound-node
+               → share-manager starts on same node ✅ co-located
 ```
 
 ### Share-manager node discovery
 
-The plugin resolves the target node using two methods, in order:
+The plugin uses the **Kubernetes Scheduling Framework** extension points in two phases:
 
-1. **ShareManager CRD** (`sharemanagers.longhorn.io/v1beta2`, `status.ownerID`) — Longhorn sets this field as soon as it assigns the share-manager to a node, **before** the share-manager pod starts. This avoids the chicken-and-egg problem where the pod hasn't started yet when the VM is being scheduled.
+**Phase 1 — Filter & Score (before binding):**
 
-2. **Share-manager pod** (fallback) — if the CRD lookup yields nothing, the plugin checks whether the `share-manager-<pv-name>` pod in `longhorn-system` is in `Running` phase.
+The plugin reads the **Longhorn Volume CRD** (`volumes.longhorn.io/v1beta2`) to determine where the volume engine was last attached:
+
+1. `spec.nodeID` — set by Longhorn after the first attachment; Longhorn always re-attaches to this node. This is the authoritative source for warm restarts.
+2. `status.currentNodeID` — the node the engine is currently attached to (identical to `spec.nodeID` when attached; used as a belt-and-suspenders fallback).
+3. Share-manager pod `spec.nodeName` — final fallback; only useful if the pod is already `Running`.
+
+If none of these yield a node (cold start — new PVC, never attached), Filter and Score are no-ops and the VM schedules on the best available node.
+
+**Phase 2 — PostBind (after binding, cold start only):**
+
+After the virt-launcher is bound to a node, the `PostBind` extension point fires. If the Longhorn Volume CRD `spec.nodeID` was empty (cold start), the plugin **patches `spec.nodeID` to the bound node**. Longhorn reads this field when deciding where to attach the volume engine — and always co-locates the share-manager pod with the engine. This guarantees co-location from the very first VM boot.
+
+For warm restarts, `PostBind` is a no-op (spec.nodeID is already set correctly).
 
 ### Live migration
 
@@ -129,13 +147,21 @@ Longhorn names share-manager pods after the **PV name** (which equals the PVC UI
 longhorn-system/share-manager-pvc-<uuid>
 ```
 
-The plugin:
+The plugin runs in two phases:
+
+**Filter & Score phase** (before the virt-launcher pod is bound):
 1. Lists all PVCs referenced by the VM pod
 2. Checks each PVC is `ReadWriteMany`
 3. Resolves the PV name from `pvc.spec.volumeName`
-4. Queries the `ShareManager` CRD (`sharemanagers.longhorn.io`) for `status.ownerID` — the node assigned by Longhorn
-5. Falls back to checking the `share-manager-<pv-name>` pod phase if the CRD yields nothing
-6. Uses the resolved node for Filter/Score
+4. Reads the **Longhorn Volume CRD** (`volumes.longhorn.io`) `spec.nodeID` — the node Longhorn last attached the engine to (set after first attachment, authoritative for warm restarts)
+5. Falls back to `status.currentNodeID` (same value when attached)
+6. Falls back to checking the running `share-manager-<pv-name>` pod `spec.nodeName`
+7. If no node is found (cold start — first ever use of this PVC), Filter and Score are no-ops
+
+**PostBind phase** (after the virt-launcher pod is bound, cold start only):
+1. If the Longhorn Volume CRD `spec.nodeID` was empty, patches it to the node the virt-launcher was just bound to
+2. Longhorn reads `spec.nodeID` when attaching the volume engine and co-locates the share-manager pod there
+3. On warm restarts (`spec.nodeID` already set), PostBind is a no-op
 
 ### Live migration behaviour
 
@@ -149,7 +175,7 @@ Migration target pods are identified by the label `kubevirt.io/migrationJobUID` 
 | Opt-in annotation value | `true` |
 | Scheduler name | `virthorn-scheduler` |
 | Share-manager namespace | `longhorn-system` |
-| ShareManager CRD | `sharemanagers.longhorn.io/v1beta2` |
+| Longhorn Volume CRD | `volumes.longhorn.io/v1beta2` |
 | Share-manager pod name pattern | `share-manager-<pv-name>` |
 | Migration target label | `kubevirt.io/migrationJobUID` |
 
@@ -184,8 +210,11 @@ kubectl -n kube-system patch deployment virthorn-scheduler --type=json \
 | `V(4)` | Node accepted — share-manager co-located on same node |
 | `V(4)` | Node rejected — share-manager on a different node |
 | `V(4)` | Score assigned — max (100) or 0, with reason |
+| `V(4)` | PostBind: cold start — `spec.nodeID` patched on Longhorn Volume CRD |
+| `V(4)` | PostBind: warm restart — `spec.nodeID` already set, skipping patch |
 | `V(5)` | Pod not opted in — plugin skipped |
 | `ErrorS` | Share-manager lookup failed (API error) |
+| `ErrorS` | PostBind: failed to patch Longhorn Volume CRD `spec.nodeID` |
 
 ### Example log output
 
