@@ -60,7 +60,7 @@ rules:
 
   # --- LonghornCoSchedule plugin permissions ---
   - apiGroups: ["longhorn.io"]
-    resources: ["sharemanagers"]
+    resources: ["sharemanagers", "volumes"]
     verbs: ["get"]
 
 ---

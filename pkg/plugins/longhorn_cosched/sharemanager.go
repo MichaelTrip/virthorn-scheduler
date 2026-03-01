@@ -12,7 +12,20 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// longhornVolumeGVR is the GroupVersionResource for the Longhorn Volume CRD.
+// spec.nodeID on this object is the authoritative node assignment for the
+// volume engine — the share-manager pod always runs on this same node.
+var longhornVolumeGVR = schema.GroupVersionResource{
+	Group:    "longhorn.io",
+	Version:  "v1beta2",
+	Resource: "volumes",
+}
+
 // shareManagerGVR is the GroupVersionResource for the Longhorn ShareManager CRD.
+// Used as a secondary fallback only — its ownerID reflects the Longhorn
+// controller manager node (which longhorn-manager pod controls this object),
+// NOT where the share-manager pod runs. Only the pod lookup from this CRD
+// is meaningful for our purposes.
 var shareManagerGVR = schema.GroupVersionResource{
 	Group:    "longhorn.io",
 	Version:  "v1beta2",
@@ -20,15 +33,14 @@ var shareManagerGVR = schema.GroupVersionResource{
 }
 
 // findShareManagerNode looks up the node where the Longhorn share-manager for
-// any of the RWX PVCs referenced by the given pod is running (or assigned).
+// any of the RWX PVCs referenced by the given pod will run.
 //
-// It first queries the ShareManager CRD (status.ownerID), which is set by
-// Longhorn before the share-manager pod reaches Running phase. This avoids the
-// chicken-and-egg problem where the pod hasn't started yet when the VM is
-// being scheduled.
-//
-// If the CRD lookup yields nothing, it falls back to inspecting the
-// share-manager pod directly (for compatibility with non-standard setups).
+// Resolution order:
+//  1. Longhorn Volume CRD (spec.nodeID / status.currentNodeID) — the volume
+//     engine node is the authoritative source; the share-manager pod always
+//     runs co-located with the engine.
+//  2. Share-manager pod directly — used as a fallback for non-standard setups
+//     or when the Volume CRD doesn't have a node assignment yet.
 func findShareManagerNode(ctx context.Context, clientset kubernetes.Interface, dynClient dynamic.Interface, pod *corev1.Pod) (string, error) {
 	podKey := klog.KObj(pod)
 	pvcNames := collectPVCNames(pod)
@@ -81,8 +93,8 @@ func collectPVCNames(pod *corev1.Pod) []string {
 }
 
 // getShareManagerNodeForPVC resolves the node for the share-manager of a
-// specific PVC. It tries the ShareManager CRD first, then falls back to the
-// share-manager pod.
+// specific PVC. It tries the Longhorn Volume CRD first (authoritative), then
+// falls back to inspecting the share-manager pod directly.
 func getShareManagerNodeForPVC(ctx context.Context, clientset kubernetes.Interface, dynClient dynamic.Interface, podNamespace, pvcName string) (string, error) {
 	// Verify the PVC exists and is RWX.
 	pvc, err := clientset.CoreV1().PersistentVolumeClaims(podNamespace).Get(ctx, pvcName, metav1.GetOptions{})
@@ -121,15 +133,20 @@ func getShareManagerNodeForPVC(ctx context.Context, clientset kubernetes.Interfa
 		return "", nil // PVC not yet bound.
 	}
 
-	// --- Primary: query the ShareManager CRD (status.ownerID) ---
-	// The ShareManager CRD is named after the PV (e.g. pvc-<uid>) and lives in
-	// longhorn-system. Longhorn sets status.ownerID as soon as it assigns the
-	// share-manager to a node — well before the pod reaches Running phase.
+	// --- Primary: query the Longhorn Volume CRD (spec.nodeID) ---
+	// The Volume CRD is named after the PV (e.g. pvc-<uid>) and lives in
+	// longhorn-system. spec.nodeID is set by Longhorn when the volume is pinned
+	// to a node — the share-manager pod always runs co-located with the volume
+	// engine on this node. This is the authoritative source.
+	//
+	// Note: the ShareManager CRD's ownerID is NOT used here because it reflects
+	// the Longhorn controller manager node (which longhorn-manager pod controls
+	// the object), not the node where the share-manager pod runs.
 	if dynClient != nil {
-		node, err := getShareManagerNodeFromCRD(ctx, dynClient, pvName)
+		node, err := getLonghornVolumeNode(ctx, dynClient, pvName)
 		if err != nil {
-			// DIAGNOSTIC: log CRD errors explicitly instead of silently discarding them.
-			klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeForPVC: ShareManager CRD lookup failed, falling back to pod lookup",
+			// DIAGNOSTIC: log Volume CRD errors explicitly.
+			klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeForPVC: Volume CRD lookup failed, falling back to pod lookup",
 				"pvName", pvName,
 				"error", err,
 			)
@@ -142,65 +159,57 @@ func getShareManagerNodeForPVC(ctx context.Context, clientset kubernetes.Interfa
 	return getShareManagerNodeFromPod(ctx, clientset, pvName)
 }
 
-// getShareManagerNodeFromCRD reads the ShareManager CRD for the given PV name
-// and returns status.ownerID if the share-manager is in a running state.
-func getShareManagerNodeFromCRD(ctx context.Context, dynClient dynamic.Interface, pvName string) (string, error) {
-	obj, err := dynClient.Resource(shareManagerGVR).Namespace(LonghornNamespace).Get(ctx, pvName, metav1.GetOptions{})
+// getLonghornVolumeNode reads the Longhorn Volume CRD for the given PV name
+// and returns the node where the volume engine is running (spec.nodeID).
+// This is authoritative for where the share-manager pod will run.
+func getLonghornVolumeNode(ctx context.Context, dynClient dynamic.Interface, pvName string) (string, error) {
+	obj, err := dynClient.Resource(longhornVolumeGVR).Namespace(LonghornNamespace).Get(ctx, pvName, metav1.GetOptions{})
 	if err != nil {
 		return "", err
 	}
 
-	// status.ownerID holds the node name assigned by Longhorn.
-	status, ok := obj.Object["status"].(map[string]interface{})
-	if !ok {
-		// DIAGNOSTIC: CRD exists but status field is missing or wrong type.
-		klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeFromCRD: ShareManager CRD has no parseable status",
-			"pvName", pvName,
-			"objectKeys", func() []string {
-				keys := make([]string, 0, len(obj.Object))
-				for k := range obj.Object {
-					keys = append(keys, k)
-				}
-				return keys
-			}(),
-		)
-		return "", nil
+	spec, hasSpec := obj.Object["spec"].(map[string]interface{})
+	status, hasStatus := obj.Object["status"].(map[string]interface{})
+
+	var specNodeID, currentNodeID, volumeState string
+	if hasSpec {
+		specNodeID, _ = spec["nodeID"].(string)
+	}
+	if hasStatus {
+		currentNodeID, _ = status["currentNodeID"].(string)
+		volumeState, _ = status["state"].(string)
 	}
 
-	ownerID, _ := status["ownerID"].(string)
-	state, _ := status["state"].(string)
-
-	// DIAGNOSTIC: log the raw CRD state+ownerID so we can see what Longhorn reported.
-	klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeFromCRD: ShareManager CRD status",
+	// DIAGNOSTIC: log the raw Volume CRD fields.
+	klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: Longhorn Volume CRD status",
 		"pvName", pvName,
-		"state", state,
-		"ownerID", ownerID,
+		"spec.nodeID", specNodeID,
+		"status.currentNodeID", currentNodeID,
+		"status.state", volumeState,
 	)
 
-	if ownerID == "" {
-		return "", nil
+	// spec.nodeID is set when the volume is pinned to a node. For RWX volumes,
+	// the share-manager pod runs on this node.
+	// We trust it in all states except empty (not yet assigned).
+	if specNodeID != "" {
+		return specNodeID, nil
 	}
 
-	// Trust ownerID for all states where Longhorn has committed to a node:
-	//   stopped  — no VM currently using the volume, but ownerID is already
-	//              authoritatively set: Longhorn will start the pod there.
-	//              This is the critical case: VM is being scheduled before the
-	//              share-manager pod exists, but the node assignment is final.
-	//   starting — pod is launching on ownerID node.
-	//   running  — pod is live and serving NFS on ownerID node.
-	//   error    — excluded: Longhorn may migrate to a different node during
-	//              recovery, so ownerID is not yet stable.
-	switch state {
-	case "stopped", "starting", "running":
-		return ownerID, nil
-	default:
-		klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeFromCRD: ShareManager CRD state not usable, skipping",
+	// status.currentNodeID is the node the volume engine is currently attached to.
+	// Use as fallback when spec.nodeID is not yet set.
+	if currentNodeID != "" {
+		klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: spec.nodeID empty, using status.currentNodeID",
 			"pvName", pvName,
-			"state", state,
-			"ownerID", ownerID,
+			"status.currentNodeID", currentNodeID,
 		)
-		return "", nil
+		return currentNodeID, nil
 	}
+
+	klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: no node assignment found in Volume CRD",
+		"pvName", pvName,
+		"status.state", volumeState,
+	)
+	return "", nil
 }
 
 // getShareManagerNodeFromPod looks up the share-manager pod for a PV and
