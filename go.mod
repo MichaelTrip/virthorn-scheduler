@@ -1,4 +1,4 @@
-module github.com/michaeltrip/kubevirt-scheduler
+module github.com/michaeltrip/virthorn-scheduler
 
 go 1.23.0
 

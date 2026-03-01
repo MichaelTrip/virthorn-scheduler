@@ -1,9 +1,9 @@
 ---
-# ServiceAccount for the kubevirt-scheduler
+# ServiceAccount for the virthorn-scheduler
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: kubevirt-scheduler
+  name: virthorn-scheduler
   namespace: kube-system
 
 ---
@@ -12,7 +12,7 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: kubevirt-scheduler
+  name: virthorn-scheduler
 rules:
   # --- Default kube-scheduler permissions ---
   - apiGroups: [""]
@@ -68,14 +68,14 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: kubevirt-scheduler
+  name: virthorn-scheduler
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: kubevirt-scheduler
+  name: virthorn-scheduler
 subjects:
   - kind: ServiceAccount
-    name: kubevirt-scheduler
+    name: virthorn-scheduler
     namespace: kube-system
 
 ---
@@ -84,7 +84,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: kubevirt-scheduler-leader-election
+  name: virthorn-scheduler-leader-election
   namespace: kube-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -92,5 +92,5 @@ roleRef:
   name: extension-apiserver-authentication-reader
 subjects:
   - kind: ServiceAccount
-    name: kubevirt-scheduler
+    name: virthorn-scheduler
     namespace: kube-system

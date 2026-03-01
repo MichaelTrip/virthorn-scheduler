@@ -1,25 +1,25 @@
 ---
-# Deployment for the kubevirt-scheduler.
+# Deployment for the virthorn-scheduler.
 # Runs alongside (not replacing) the default kube-scheduler.
-# VMs opt in by setting spec.schedulerName: kubevirt-scheduler.
+# VMs opt in by setting spec.schedulerName: virthorn-scheduler.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: kubevirt-scheduler
+  name: virthorn-scheduler
   namespace: kube-system
   labels:
-    app: kubevirt-scheduler
+    app: virthorn-scheduler
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: kubevirt-scheduler
+      app: virthorn-scheduler
   template:
     metadata:
       labels:
-        app: kubevirt-scheduler
+        app: virthorn-scheduler
     spec:
-      serviceAccountName: kubevirt-scheduler
+      serviceAccountName: virthorn-scheduler
       # Run on control-plane nodes alongside the default scheduler
       nodeSelector:
         node-role.kubernetes.io/control-plane: ""
@@ -29,12 +29,12 @@ spec:
           effect: NoSchedule
       priorityClassName: system-cluster-critical
       containers:
-        - name: kubevirt-scheduler
+        - name: virthorn-scheduler
           # Replace with your actual image reference after building and pushing
-          image: ghcr.io/michaeltrip/kubevirt-scheduler:1.0.0
+          image: ghcr.io/michaeltrip/virthorn-scheduler:1.0.0
           imagePullPolicy: IfNotPresent
           command:
-            - /kubevirt-scheduler
+            - /virthorn-scheduler
             - --config=/etc/kubernetes/scheduler/scheduler-config.yaml
             - --v=4
           resources:
@@ -76,4 +76,4 @@ spec:
       volumes:
         - name: scheduler-config
           configMap:
-            name: kubevirt-scheduler-config
+            name: virthorn-scheduler-config

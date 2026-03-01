@@ -13,7 +13,7 @@ import (
 	_ "k8s.io/component-base/metrics/prometheus/version"  // register version metrics
 	"k8s.io/kubernetes/cmd/kube-scheduler/app"
 
-	"github.com/michaeltrip/kubevirt-scheduler/pkg/plugins/longhorn_cosched"
+	"github.com/michaeltrip/virthorn-scheduler/pkg/plugins/longhorn_cosched"
 )
 
 func main() {

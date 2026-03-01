@@ -18,15 +18,15 @@ COPY . .
 # Build the scheduler binary
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w" \
-    -o /workspace/kubevirt-scheduler \
+    -o /workspace/virthorn-scheduler \
     ./cmd/scheduler
 
 # ---- Final stage ----
 # Use distroless for a minimal, secure image
 FROM gcr.io/distroless/static:nonroot
 
-COPY --from=builder /workspace/kubevirt-scheduler /kubevirt-scheduler
+COPY --from=builder /workspace/virthorn-scheduler /virthorn-scheduler
 
 USER 65532:65532
 
-ENTRYPOINT ["/kubevirt-scheduler"]
+ENTRYPOINT ["/virthorn-scheduler"]

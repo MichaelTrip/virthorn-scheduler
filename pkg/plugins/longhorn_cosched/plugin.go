@@ -20,7 +20,7 @@ const (
 
 	// AnnotationKey is the opt-in annotation that must be set on a pod to enable
 	// co-scheduling with its Longhorn share-manager pod.
-	AnnotationKey = "scheduler.kubevirt-scheduler.io/co-schedule"
+	AnnotationKey = "scheduler.virthorn-scheduler.io/co-schedule"
 
 	// AnnotationValue is the value the annotation must have to opt in.
 	AnnotationValue = "true"

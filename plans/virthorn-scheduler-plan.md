@@ -1,4 +1,4 @@
-# KubeVirt Scheduler — Architecture Plan
+# VirtHorn Scheduler — Architecture Plan
 
 ## Problem Statement
 
@@ -10,14 +10,14 @@ When KubeVirt VMs use **Longhorn RWX** volumes, Longhorn creates a `share-manage
 
 ## Solution Overview
 
-Build a **custom Kubernetes scheduler** (named `kubevirt-scheduler`) as a standalone binary that embeds the default `kube-scheduler` with an additional custom plugin registered. The plugin implements two extension points:
+Build a **custom Kubernetes scheduler** (named `virthorn-scheduler`) as a standalone binary that embeds the default `kube-scheduler` with an additional custom plugin registered. The plugin implements two extension points:
 
 | Extension Point | Purpose |
 |---|---|
 | **Filter** | If a share-manager pod already exists for the VM's PVC, remove all nodes except the one where the share-manager runs |
 | **Score** | If no share-manager pod exists yet, score nodes normally (plugin is a no-op); if one exists, give the share-manager's node the highest score |
 
-The scheduler is **opt-in** via a pod annotation. Only pods with the annotation `kubevirt-scheduler/co-schedule: "true"` are processed by the plugin logic.
+The scheduler is **opt-in** via a pod annotation. Only pods with the annotation `virthorn-scheduler/co-schedule: "true"` are processed by the plugin logic.
 
 ---
 
@@ -25,7 +25,7 @@ The scheduler is **opt-in** via a pod annotation. Only pods with the annotation 
 
 ```mermaid
 graph TD
-    A[KubeVirt VM Pod created] --> B{Has annotation\nkubevirt-scheduler/co-schedule: true?}
+    A[KubeVirt VM Pod created] --> B{Has annotation\nvirthorn-scheduler/co-schedule: true?}
     B -- No --> C[Default scheduling logic]
     B -- Yes --> D[Plugin: inspect PVCs on the pod]
     D --> E{Longhorn RWX share-manager\npod exists for PVC?}
@@ -42,7 +42,7 @@ graph TD
 
 ### 1. Opt-in Annotation
 ```
-kubevirt-scheduler/co-schedule: "true"
+virthorn-scheduler/co-schedule: "true"
 ```
 Applied to the KubeVirt `VirtualMachineInstance` pod (the `virt-launcher` pod). KubeVirt propagates annotations from the VM spec to the virt-launcher pod.
 
@@ -69,14 +69,14 @@ in the `longhorn-system` namespace. The plugin will:
 - If annotation present and share-manager found on node X → return score 100 for node X, 0 for all others
 
 ### 4. Scheduler Configuration
-The custom scheduler runs as a **separate scheduler** (not replacing `kube-scheduler`). VMs opt-in by setting `spec.schedulerName: kubevirt-scheduler` in the VirtualMachine spec.
+The custom scheduler runs as a **separate scheduler** (not replacing `kube-scheduler`). VMs opt-in by setting `spec.schedulerName: virthorn-scheduler` in the VirtualMachine spec.
 
 ---
 
 ## Project Structure
 
 ```
-kubevirt-scheduler/
+virthorn-scheduler/
 ├── cmd/
 │   └── scheduler/
 │       └── main.go                  # Entry point, registers plugin
@@ -140,7 +140,7 @@ The scheduler needs the following permissions beyond the default scheduler:
 apiVersion: kubescheduler.config.k8s.io/v1
 kind: KubeSchedulerConfiguration
 profiles:
-  - schedulerName: kubevirt-scheduler
+  - schedulerName: virthorn-scheduler
     plugins:
       filter:
         enabled:
@@ -163,9 +163,9 @@ spec:
   template:
     metadata:
       annotations:
-        kubevirt-scheduler/co-schedule: "true"
+        virthorn-scheduler/co-schedule: "true"
     spec:
-      schedulerName: kubevirt-scheduler
+      schedulerName: virthorn-scheduler
       volumes:
         - name: datavol
           persistentVolumeClaim:
@@ -179,13 +179,13 @@ spec:
 ```mermaid
 sequenceDiagram
     participant K as kube-apiserver
-    participant S as kubevirt-scheduler
+    participant S as virthorn-scheduler
     participant P as Plugin: LonghornCoSchedule
     participant L as longhorn-system namespace
 
     K->>S: Pod pending scheduling
     S->>P: RunFilterPlugins for each node
-    P->>P: Check annotation kubevirt-scheduler/co-schedule
+    P->>P: Check annotation virthorn-scheduler/co-schedule
     P->>K: List PVCs referenced by pod
     P->>L: Get pod share-manager-pvcname
     L-->>P: share-manager running on node-2
@@ -199,7 +199,7 @@ sequenceDiagram
 
 ## Implementation Steps
 
-1. **Initialize Go module** — `go mod init github.com/yourusername/kubevirt-scheduler`
+1. **Initialize Go module** — `go mod init github.com/yourusername/virthorn-scheduler`
 2. **Plugin skeleton** — implement `framework.Plugin`, `framework.FilterPlugin`, `framework.ScorePlugin` interfaces
 3. **Share-manager lookup** — query `longhorn-system` namespace for `share-manager-<pvc-name>` pods
 4. **Filter logic** — if share-manager found, return `framework.NewStatus(framework.Unschedulable)` for non-matching nodes

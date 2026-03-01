@@ -1,6 +1,22 @@
-# kubevirt-scheduler
+<div align="center">
+  <img src="img/virthorn.png" alt="Virthorn Logo" width="320" />
 
-A custom Kubernetes scheduler that co-locates **KubeVirt VM pods** with their **Longhorn RWX share-manager pods** on the same node, eliminating cross-node NFS traffic.
+  # virthorn-scheduler
+
+  **A custom Kubernetes scheduler that co-locates KubeVirt VM pods with their Longhorn RWX share-manager pods — eliminating cross-node NFS traffic.**
+
+  [![CI](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/ci.yaml/badge.svg)](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/ci.yaml)
+  [![Release](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/release.yaml/badge.svg)](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/release.yaml)
+  [![Go Report Card](https://goreportcard.com/badge/github.com/michaeltrip/virthorn-scheduler)](https://goreportcard.com/report/github.com/michaeltrip/virthorn-scheduler)
+  [![Go version](https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+  [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+  [![GHCR](https://img.shields.io/badge/container-ghcr.io-24292e?logo=github)](https://github.com/michaeltrip/virthorn-scheduler/pkgs/container/virthorn-scheduler)
+  [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.32-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io/)
+  [![KubeVirt](https://img.shields.io/badge/KubeVirt-compatible-blueviolet)](https://kubevirt.io/)
+  [![Longhorn](https://img.shields.io/badge/Longhorn-RWX-orange)](https://longhorn.io/)
+</div>
+
+---
 
 ## Problem
 
@@ -8,7 +24,7 @@ When KubeVirt VMs use Longhorn RWX volumes, Longhorn creates a `share-manager` p
 
 ## Solution
 
-`kubevirt-scheduler` is a custom Kubernetes scheduler built with the [Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/). It implements two extension points:
+`virthorn-scheduler` is a custom Kubernetes scheduler built with the [Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/). It implements two extension points:
 
 | Plugin | Behaviour |
 |---|---|
@@ -28,7 +44,7 @@ VM Pod created
   │    └─ Plugin is a no-op — KubeVirt migration controller
   │       handles node selection via node affinity
   │
-  └─ annotation scheduler.kubevirt-scheduler.io/co-schedule: "true"
+  └─ annotation scheduler.virthorn-scheduler.io/co-schedule: "true"
        │
        ├─ No share-manager found yet
        │    └─ VM schedules freely on best node
@@ -56,8 +72,8 @@ When `virtctl migrate` is used, KubeVirt creates a new **target virt-launcher po
 ### 1. Build and push the image
 
 ```bash
-docker build -t ghcr.io/<your-org>/kubevirt-scheduler:latest .
-docker push ghcr.io/<your-org>/kubevirt-scheduler:latest
+docker build -t ghcr.io/<your-org>/virthorn-scheduler:latest .
+docker push ghcr.io/<your-org>/virthorn-scheduler:latest
 ```
 
 Update the `image:` field in [`manifests/deployment.yaml`](manifests/deployment.yaml) to match.
@@ -73,7 +89,7 @@ kubectl apply -f manifests/deployment.yaml
 ### 3. Verify the scheduler is running
 
 ```bash
-kubectl -n kube-system get pods -l app=kubevirt-scheduler
+kubectl -n kube-system get pods -l app=virthorn-scheduler
 ```
 
 ## Usage
@@ -91,9 +107,9 @@ spec:
   template:
     metadata:
       annotations:
-        scheduler.kubevirt-scheduler.io/co-schedule: "true"   # opt-in to co-scheduling
+        scheduler.virthorn-scheduler.io/co-schedule: "true"   # opt-in to co-scheduling
     spec:
-      schedulerName: kubevirt-scheduler           # use our custom scheduler
+      schedulerName: virthorn-scheduler           # use our custom scheduler
       domain:
         # ... your VM spec ...
       volumes:
@@ -128,9 +144,9 @@ Migration target pods are identified by the label `kubevirt.io/migrationJobUID` 
 
 | Item | Value |
 |---|---|
-| Opt-in annotation key | `scheduler.kubevirt-scheduler.io/co-schedule` |
+| Opt-in annotation key | `scheduler.virthorn-scheduler.io/co-schedule` |
 | Opt-in annotation value | `true` |
-| Scheduler name | `kubevirt-scheduler` |
+| Scheduler name | `virthorn-scheduler` |
 | Share-manager namespace | `longhorn-system` |
 | ShareManager CRD | `sharemanagers.longhorn.io/v1beta2` |
 | Share-manager pod name pattern | `share-manager-<pv-name>` |
@@ -146,7 +162,7 @@ The verbosity flag is set in [`manifests/deployment.yaml`](manifests/deployment.
 
 ```yaml
 command:
-  - /kubevirt-scheduler
+  - /virthorn-scheduler
   - --config=/etc/kubernetes/scheduler/scheduler-config.yaml
   - --v=4   # change to 2 for quieter output, 5 for trace-level
 ```
@@ -154,7 +170,7 @@ command:
 To change it on a running cluster without redeploying:
 
 ```bash
-kubectl -n kube-system patch deployment kubevirt-scheduler --type=json \
+kubectl -n kube-system patch deployment virthorn-scheduler --type=json \
   -p='[{"op":"replace","path":"/spec/template/spec/containers/0/command/2","value":"--v=4"}]'
 ```
 
@@ -199,7 +215,7 @@ LonghornCoSchedule/Score: no share-manager found, scoring 0        pod=... node=
 ### Tailing the scheduler logs
 
 ```bash
-kubectl -n kube-system logs -l app=kubevirt-scheduler -f | grep LonghornCoSchedule
+kubectl -n kube-system logs -l app=virthorn-scheduler -f | grep LonghornCoSchedule
 ```
 
 ## Development
@@ -212,7 +228,7 @@ kubectl -n kube-system logs -l app=kubevirt-scheduler -f | grep LonghornCoSchedu
 ### Build
 
 ```bash
-go build -o kubevirt-scheduler ./cmd/scheduler
+go build -o virthorn-scheduler ./cmd/scheduler
 ```
 
 ### Test
@@ -224,7 +240,7 @@ go test ./pkg/...
 ### Project Structure
 
 ```
-kubevirt-scheduler/
+virthorn-scheduler/
 ├── cmd/scheduler/main.go                        # Entry point
 ├── pkg/plugins/longhorn_cosched/
 │   ├── plugin.go                                # Plugin registration, constants & helpers

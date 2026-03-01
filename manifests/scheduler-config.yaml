@@ -1,11 +1,11 @@
 ---
-# ConfigMap holding the KubeSchedulerConfiguration for kubevirt-scheduler.
+# ConfigMap holding the KubeSchedulerConfiguration for virthorn-scheduler.
 # This registers the LonghornCoSchedule plugin at the Filter and Score
 # extension points, alongside all default plugins.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: kubevirt-scheduler-config
+  name: virthorn-scheduler-config
   namespace: kube-system
 data:
   scheduler-config.yaml: |
@@ -13,10 +13,10 @@ data:
     kind: KubeSchedulerConfiguration
     leaderElection:
       leaderElect: true
-      resourceName: kubevirt-scheduler
+      resourceName: virthorn-scheduler
       resourceNamespace: kube-system
     profiles:
-      - schedulerName: kubevirt-scheduler
+      - schedulerName: virthorn-scheduler
         plugins:
           filter:
             enabled:

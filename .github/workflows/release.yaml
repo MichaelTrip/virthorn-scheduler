@@ -38,7 +38,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/michaeltrip/kubevirt-scheduler
+          images: ghcr.io/michaeltrip/virthorn-scheduler
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -58,7 +58,7 @@ jobs:
         env:
           TAG: ${{ steps.meta.outputs.version }}
         run: |
-          sed -i "s|image: ghcr.io/michaeltrip/kubevirt-scheduler:.*|image: ghcr.io/michaeltrip/kubevirt-scheduler:${TAG}|" \
+          sed -i "s|image: ghcr.io/michaeltrip/virthorn-scheduler:.*|image: ghcr.io/michaeltrip/virthorn-scheduler:${TAG}|" \
             manifests/deployment.yaml
 
       - name: Commit updated deployment.yaml
