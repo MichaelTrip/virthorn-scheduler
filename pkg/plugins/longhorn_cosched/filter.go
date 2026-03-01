@@ -21,8 +21,26 @@ import (
 func (p *Plugin) Filter(ctx context.Context, state *framework.CycleState, pod *corev1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
 	podKey := klog.KObj(pod)
 
+	// DIAGNOSTIC: log scheduler name and opt-in annotation for every pod that enters Filter.
+	klog.V(4).InfoS("LonghornCoSchedule/Filter: evaluating pod",
+		"pod", podKey,
+		"schedulerName", pod.Spec.SchedulerName,
+		"annotations", pod.Annotations,
+		"labels", pod.Labels,
+	)
+
 	if !isOptedIn(pod) {
-		klog.V(5).InfoS("LonghornCoSchedule/Filter: pod not opted in, skipping", "pod", podKey)
+		klog.V(4).InfoS("LonghornCoSchedule/Filter: pod not opted in, skipping",
+			"pod", podKey,
+			"schedulerName", pod.Spec.SchedulerName,
+			"annotationKey", AnnotationKey,
+			"annotationValue", func() string {
+				if pod.Annotations != nil {
+					return pod.Annotations[AnnotationKey]
+				}
+				return "<no annotations>"
+			}(),
+		)
 		return nil
 	}
 

@@ -9,6 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 )
 
 // shareManagerGVR is the GroupVersionResource for the Longhorn ShareManager CRD.
@@ -29,8 +30,20 @@ var shareManagerGVR = schema.GroupVersionResource{
 // If the CRD lookup yields nothing, it falls back to inspecting the
 // share-manager pod directly (for compatibility with non-standard setups).
 func findShareManagerNode(ctx context.Context, clientset kubernetes.Interface, dynClient dynamic.Interface, pod *corev1.Pod) (string, error) {
+	podKey := klog.KObj(pod)
 	pvcNames := collectPVCNames(pod)
+
+	// DIAGNOSTIC: log how many PVCs were found on the pod's volumes.
+	klog.V(4).InfoS("LonghornCoSchedule/findShareManagerNode: collected PVCs from pod volumes",
+		"pod", podKey,
+		"pvcCount", len(pvcNames),
+		"pvcNames", pvcNames,
+	)
+
 	if len(pvcNames) == 0 {
+		klog.V(4).InfoS("LonghornCoSchedule/findShareManagerNode: no PVCs found on pod, plugin is a no-op",
+			"pod", podKey,
+		)
 		return "", nil
 	}
 
@@ -40,10 +53,19 @@ func findShareManagerNode(ctx context.Context, clientset kubernetes.Interface, d
 			return "", err
 		}
 		if node != "" {
+			klog.V(4).InfoS("LonghornCoSchedule/findShareManagerNode: resolved share-manager node",
+				"pod", podKey,
+				"pvcName", pvcName,
+				"shareManagerNode", node,
+			)
 			return node, nil
 		}
 	}
 
+	klog.V(4).InfoS("LonghornCoSchedule/findShareManagerNode: no share-manager node found for any PVC",
+		"pod", podKey,
+		"pvcNames", pvcNames,
+	)
 	return "", nil
 }
 
@@ -65,15 +87,37 @@ func getShareManagerNodeForPVC(ctx context.Context, clientset kubernetes.Interfa
 	// Verify the PVC exists and is RWX.
 	pvc, err := clientset.CoreV1().PersistentVolumeClaims(podNamespace).Get(ctx, pvcName, metav1.GetOptions{})
 	if err != nil {
+		// DIAGNOSTIC: log PVC lookup failures (could be RBAC or namespace issue).
+		klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeForPVC: PVC not found or error, skipping",
+			"pvcName", pvcName,
+			"namespace", podNamespace,
+			"error", err,
+		)
 		return "", nil // PVC not found — skip silently.
 	}
 
+	// DIAGNOSTIC: log access modes so we can see why isRWX might return false.
+	klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeForPVC: PVC found",
+		"pvcName", pvcName,
+		"pvName", pvc.Spec.VolumeName,
+		"accessModes", pvc.Spec.AccessModes,
+		"isRWX", isRWX(pvc),
+		"phase", pvc.Status.Phase,
+	)
+
 	if !isRWX(pvc) {
+		klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeForPVC: PVC is not RWX, skipping",
+			"pvcName", pvcName,
+			"accessModes", pvc.Spec.AccessModes,
+		)
 		return "", nil // Not RWX — Longhorn won't create a share-manager.
 	}
 
 	pvName := pvc.Spec.VolumeName
 	if pvName == "" {
+		klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeForPVC: PVC not yet bound, skipping",
+			"pvcName", pvcName,
+		)
 		return "", nil // PVC not yet bound.
 	}
 
@@ -84,8 +128,11 @@ func getShareManagerNodeForPVC(ctx context.Context, clientset kubernetes.Interfa
 	if dynClient != nil {
 		node, err := getShareManagerNodeFromCRD(ctx, dynClient, pvName)
 		if err != nil {
-			// Log but don't fail — fall through to pod-based lookup.
-			_ = fmt.Errorf("ShareManager CRD lookup failed for %s: %w", pvName, err)
+			// DIAGNOSTIC: log CRD errors explicitly instead of silently discarding them.
+			klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeForPVC: ShareManager CRD lookup failed, falling back to pod lookup",
+				"pvName", pvName,
+				"error", err,
+			)
 		} else if node != "" {
 			return node, nil
 		}
@@ -106,21 +153,45 @@ func getShareManagerNodeFromCRD(ctx context.Context, dynClient dynamic.Interface
 	// status.ownerID holds the node name assigned by Longhorn.
 	status, ok := obj.Object["status"].(map[string]interface{})
 	if !ok {
+		// DIAGNOSTIC: CRD exists but status field is missing or wrong type.
+		klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeFromCRD: ShareManager CRD has no parseable status",
+			"pvName", pvName,
+			"objectKeys", func() []string {
+				keys := make([]string, 0, len(obj.Object))
+				for k := range obj.Object {
+					keys = append(keys, k)
+				}
+				return keys
+			}(),
+		)
 		return "", nil
 	}
 
 	ownerID, _ := status["ownerID"].(string)
+	state, _ := status["state"].(string)
+
+	// DIAGNOSTIC: log the raw CRD state+ownerID so we can see what Longhorn reported.
+	klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeFromCRD: ShareManager CRD status",
+		"pvName", pvName,
+		"state", state,
+		"ownerID", ownerID,
+	)
+
 	if ownerID == "" {
 		return "", nil
 	}
 
 	// Only use the ownerID if the share-manager is in a usable state.
 	// Longhorn states: stopped, starting, running, error
-	state, _ := status["state"].(string)
 	switch state {
 	case "running", "starting":
 		return ownerID, nil
 	default:
+		klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeFromCRD: ShareManager CRD state not usable, skipping",
+			"pvName", pvName,
+			"state", state,
+			"ownerID", ownerID,
+		)
 		return "", nil
 	}
 }
@@ -132,13 +203,30 @@ func getShareManagerNodeFromPod(ctx context.Context, clientset kubernetes.Interf
 	shareManagerName := fmt.Sprintf("%s%s", ShareManagerPrefix, pvName)
 	smPod, err := clientset.CoreV1().Pods(LonghornNamespace).Get(ctx, shareManagerName, metav1.GetOptions{})
 	if err != nil {
+		// DIAGNOSTIC: log pod lookup failures — could be RBAC or the pod simply not created yet.
+		klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeFromPod: share-manager pod not found (may not exist yet)",
+			"shareManagerName", shareManagerName,
+			"error", err,
+		)
 		return "", nil // Pod doesn't exist yet — that's fine.
 	}
+
+	// DIAGNOSTIC: log the pod's phase and node so we can see why it may not match.
+	klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeFromPod: share-manager pod found",
+		"shareManagerName", shareManagerName,
+		"phase", smPod.Status.Phase,
+		"nodeName", smPod.Spec.NodeName,
+	)
 
 	if smPod.Status.Phase == corev1.PodRunning && smPod.Spec.NodeName != "" {
 		return smPod.Spec.NodeName, nil
 	}
 
+	klog.V(4).InfoS("LonghornCoSchedule/getShareManagerNodeFromPod: share-manager pod not yet running on a node, returning empty",
+		"shareManagerName", shareManagerName,
+		"phase", smPod.Status.Phase,
+		"nodeName", smPod.Spec.NodeName,
+	)
 	return "", nil
 }
 
