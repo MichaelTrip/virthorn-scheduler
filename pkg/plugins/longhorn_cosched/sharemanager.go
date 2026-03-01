@@ -160,8 +160,19 @@ func getShareManagerNodeForPVC(ctx context.Context, clientset kubernetes.Interfa
 }
 
 // getLonghornVolumeNode reads the Longhorn Volume CRD for the given PV name
-// and returns the node where the volume engine is running (spec.nodeID).
-// This is authoritative for where the share-manager pod will run.
+// and returns the node where the volume engine will run (or is running).
+//
+// Resolution priority within this CRD:
+//  1. spec.nodeID        — set by Longhorn when the volume has been attached before;
+//     Longhorn re-attaches to this node on the next use.
+//  2. status.currentNodeID — the node the engine is currently attached to
+//     (same value as spec.nodeID when attached).
+//  3. status.ownerID     — the Longhorn manager node responsible for this volume.
+//     When the volume is detached and has never been attached
+//     (spec.nodeID=""), the owning manager schedules the attach
+//     and picks a node with a healthy replica. In practice the
+//     manager attaches the volume to a node close to itself,
+//     which is where the share-manager pod will run.
 func getLonghornVolumeNode(ctx context.Context, dynClient dynamic.Interface, pvName string) (string, error) {
 	obj, err := dynClient.Resource(longhornVolumeGVR).Namespace(LonghornNamespace).Get(ctx, pvName, metav1.GetOptions{})
 	if err != nil {
@@ -171,38 +182,59 @@ func getLonghornVolumeNode(ctx context.Context, dynClient dynamic.Interface, pvN
 	spec, hasSpec := obj.Object["spec"].(map[string]interface{})
 	status, hasStatus := obj.Object["status"].(map[string]interface{})
 
-	var specNodeID, currentNodeID, volumeState string
+	var specNodeID, currentNodeID, ownerID, volumeState string
 	if hasSpec {
 		specNodeID, _ = spec["nodeID"].(string)
 	}
 	if hasStatus {
 		currentNodeID, _ = status["currentNodeID"].(string)
+		ownerID, _ = status["ownerID"].(string)
 		volumeState, _ = status["state"].(string)
 	}
 
-	// DIAGNOSTIC: log the raw Volume CRD fields.
+	// DIAGNOSTIC: log all relevant Volume CRD fields.
 	klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: Longhorn Volume CRD status",
 		"pvName", pvName,
 		"spec.nodeID", specNodeID,
 		"status.currentNodeID", currentNodeID,
+		"status.ownerID", ownerID,
 		"status.state", volumeState,
 	)
 
-	// spec.nodeID is set when the volume is pinned to a node. For RWX volumes,
-	// the share-manager pod runs on this node.
-	// We trust it in all states except empty (not yet assigned).
+	// 1. spec.nodeID: Longhorn persists the last-used attachment node here.
+	//    This is set from the first attachment onward and is the most reliable
+	//    predictor of where the volume engine (and share-manager pod) will run.
 	if specNodeID != "" {
+		klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: using spec.nodeID",
+			"pvName", pvName,
+			"node", specNodeID,
+		)
 		return specNodeID, nil
 	}
 
-	// status.currentNodeID is the node the volume engine is currently attached to.
-	// Use as fallback when spec.nodeID is not yet set.
+	// 2. status.currentNodeID: node the engine is currently attached to.
+	//    Identical to spec.nodeID when attached; use as belt-and-suspenders fallback.
 	if currentNodeID != "" {
 		klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: spec.nodeID empty, using status.currentNodeID",
 			"pvName", pvName,
-			"status.currentNodeID", currentNodeID,
+			"node", currentNodeID,
 		)
 		return currentNodeID, nil
+	}
+
+	// 3. status.ownerID: Longhorn manager responsible for this volume.
+	//    When the volume is detached (spec.nodeID=""), the owning manager will
+	//    handle the next attach request and tends to attach to a node with a
+	//    replica — in practice the node where the manager itself runs, which
+	//    is the ownerID node. This correctly predicted share-manager placement
+	//    in testing for the "first start / fully detached" scenario.
+	if ownerID != "" {
+		klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: volume detached, using status.ownerID as attachment predictor",
+			"pvName", pvName,
+			"node", ownerID,
+			"status.state", volumeState,
+		)
+		return ownerID, nil
 	}
 
 	klog.V(4).InfoS("LonghornCoSchedule/getLonghornVolumeNode: no node assignment found in Volume CRD",
