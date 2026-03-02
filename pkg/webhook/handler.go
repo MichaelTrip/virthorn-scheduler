@@ -15,11 +15,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 )
@@ -134,15 +136,8 @@ func (h *Handler) handleVirtLauncher(ctx context.Context, req *admissionv1.Admis
 	}
 
 	// Find the share-manager node for any RWX PVC on this pod.
-	// DIAGNOSTIC: log the namespace values to confirm req.Namespace vs pod.Namespace.
-	klog.V(2).InfoS("webhook/virt-launcher: namespace diagnostic",
-		"pod", podKey,
-		"req.Namespace", req.Namespace,
-		"pod.Namespace", pod.Namespace,
-		"namespace(used)", namespace,
-		"isOptedIn", isOptedIn(pod),
-		"annotations", pod.Annotations,
-	)
+	// Use the resolved namespace (pod.Namespace), not req.Namespace which is empty
+	// for cluster-scoped webhook configurations.
 	shareManagerNode, shareManagerPodName, err := h.findShareManagerForVirtLauncher(ctx, namespace, pod)
 	if err != nil {
 		klog.ErrorS(err, "webhook/virt-launcher: error looking up share-manager", "pod", podKey)
@@ -184,13 +179,6 @@ func (h *Handler) handleShareManager(ctx context.Context, req *admissionv1.Admis
 		return allow(req.UID)
 	}
 
-	// DIAGNOSTIC: log what we know about the share-manager pod before lookup.
-	klog.V(2).InfoS("webhook/share-manager: starting virt-launcher lookup",
-		"pod", podKey,
-		"pvName", pvName,
-		"req.Namespace", req.Namespace,
-		"pod.Namespace", pod.Namespace,
-	)
 	// Find the opted-in virt-launcher pod that uses this PV.
 	virtLauncherNode, virtLauncherPodName, err := h.findVirtLauncherForPV(ctx, pvName)
 	if err != nil {
@@ -274,7 +262,13 @@ func (h *Handler) findShareManagerForVirtLauncher(ctx context.Context, namespace
 }
 
 // findVirtLauncherForPV finds the opted-in virt-launcher pod that uses the PVC
-// bound to the given PV name, and returns the node it is running on.
+// bound to the given PV name, and returns the node it is scheduled on.
+//
+// To handle the race condition where the virt-launcher and share-manager are
+// created simultaneously, this function retries with exponential backoff for up
+// to 10 seconds when a matching virt-launcher pod exists but has not yet been
+// assigned a node by the scheduler.
+//
 // Returns the node name, the virt-launcher pod name, and any error.
 func (h *Handler) findVirtLauncherForPV(ctx context.Context, pvName string) (string, string, error) {
 	// Find the PVC that is bound to this PV (search all namespaces).
@@ -298,72 +292,66 @@ func (h *Handler) findVirtLauncherForPV(ctx context.Context, pvName string) (str
 		return "", "", nil
 	}
 
-	// Find virt-launcher pods in that namespace that use this PVC.
-	// KubeVirt sets kubevirt.io=virt-launcher on all virt-launcher pods.
-	// Use a label selector to limit the list to virt-launcher pods only.
-	podList, err := h.client.CoreV1().Pods(pvcNamespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%s", VirtLauncherLabel, VirtLauncherLabelValue),
-	})
-	if err != nil {
-		return "", "", fmt.Errorf("listing pods in namespace %q: %w", pvcNamespace, err)
-	}
-
-	for i := range podList.Items {
-		p := &podList.Items[i]
-		pKey := fmt.Sprintf("%s/%s", p.Namespace, p.Name)
-
-		// DIAGNOSTIC: log every candidate pod's state.
-		klog.V(2).InfoS("webhook/findVirtLauncherForPV: evaluating candidate pod",
-			"pod", pKey,
-			"phase", p.Status.Phase,
-			"nodeName", p.Spec.NodeName,
-			"isVirtLauncher", isVirtLauncher(p),
-			"isOptedIn", isOptedIn(p),
-			"isMigrationTarget", isMigrationTarget(p),
-			"usesPVC", podUsesPVC(p, pvcName),
-			"annotations", p.Annotations,
-			"labels", p.Labels,
-		)
-
-		// Must be a virt-launcher pod.
-		if !isVirtLauncher(p) {
-			continue
-		}
-		// Must be opted in.
-		if !isOptedIn(p) {
-			klog.V(2).InfoS("webhook/findVirtLauncherForPV: pod not opted in, skipping", "pod", pKey, "annotations", p.Annotations)
-			continue
-		}
-		// Must not be a migration target.
-		if isMigrationTarget(p) {
-			continue
-		}
-		// Must reference the PVC.
-		if !podUsesPVC(p, pvcName) {
-			continue
-		}
-		// Must be scheduled to a node (NodeName set by scheduler, even if not yet Running).
-		if p.Spec.NodeName == "" {
-			klog.V(4).InfoS("webhook: virt-launcher pod found but not yet scheduled",
-				"pod", pKey,
-			)
-			continue
-		}
-
-		klog.V(2).InfoS("webhook/findVirtLauncherForPV: found matching virt-launcher",
-			"pod", pKey,
-			"nodeName", p.Spec.NodeName,
-			"phase", p.Status.Phase,
-		)
-		return p.Spec.NodeName, pKey, nil
-	}
-
-	klog.V(4).InfoS("webhook: no running opted-in virt-launcher found for PVC",
-		"pvName", pvName,
-		"pvcName", pvcName,
-		"pvcNamespace", pvcNamespace,
+	// Retry loop: poll until the virt-launcher pod is scheduled (NodeName set)
+	// or the context deadline is reached. This handles the race condition where
+	// the share-manager webhook fires while the virt-launcher is still being
+	// admitted/scheduled by the Kubernetes scheduler.
+	//
+	// Backoff: 200ms, 400ms, 800ms, 1.6s, 3.2s → max ~6s total, cap 10s.
+	var (
+		foundNode    string
+		foundPodName string
 	)
-	return "", "", nil
+	backoff := wait.Backoff{
+		Duration: 200 * time.Millisecond,
+		Factor:   2.0,
+		Jitter:   0.1,
+		Steps:    6,
+		Cap:      10 * time.Second,
+	}
+	_ = wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
+		// Find virt-launcher pods in that namespace that use this PVC.
+		podList, err := h.client.CoreV1().Pods(pvcNamespace).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("%s=%s", VirtLauncherLabel, VirtLauncherLabelValue),
+		})
+		if err != nil {
+			klog.V(4).InfoS("webhook: error listing pods, will retry",
+				"namespace", pvcNamespace, "error", err)
+			return false, nil // transient error, retry
+		}
+
+		for i := range podList.Items {
+			p := &podList.Items[i]
+			pKey := fmt.Sprintf("%s/%s", p.Namespace, p.Name)
+
+			if !isVirtLauncher(p) || !isOptedIn(p) || isMigrationTarget(p) || !podUsesPVC(p, pvcName) {
+				continue
+			}
+
+			if p.Spec.NodeName == "" {
+				klog.V(4).InfoS("webhook: virt-launcher pod found but not yet scheduled, retrying",
+					"pod", pKey,
+				)
+				return false, nil // pod exists but not scheduled yet — retry
+			}
+
+			foundNode = p.Spec.NodeName
+			foundPodName = pKey
+			return true, nil // done
+		}
+
+		// No matching pod found at all — don't retry, it won't appear.
+		return true, nil
+	})
+
+	if foundNode == "" {
+		klog.V(4).InfoS("webhook: no scheduled opted-in virt-launcher found for PVC",
+			"pvName", pvName,
+			"pvcName", pvcName,
+			"pvcNamespace", pvcNamespace,
+		)
+	}
+	return foundNode, foundPodName, nil
 }
 
 // buildAffinityPatch builds a JSON patch (RFC 6902) that sets a nodeAffinity
