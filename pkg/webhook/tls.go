@@ -93,39 +93,44 @@ func EnsureTLS(ctx context.Context, client kubernetes.Interface, serviceName, na
 	return &tlsCert, bundle.CACert, nil
 }
 
-// PatchWebhookCABundle patches the caBundle field in all webhooks of the
-// MutatingWebhookConfiguration with the given CA certificate PEM.
+// PatchWebhookCABundle patches only the caBundle field in each webhook of the
+// MutatingWebhookConfiguration using a JSON Patch (RFC 6902).
+//
+// A merge patch is NOT used here because it would replace the entire webhooks
+// array entry with only the fields present in the patch document, stripping
+// required fields like sideEffects, clientConfig, and admissionReviewVersions.
+// A JSON Patch with op=replace on the specific path leaves all other fields intact.
 func PatchWebhookCABundle(ctx context.Context, client kubernetes.Interface, caPEM []byte) error {
 	wc, err := client.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, WebhookConfigName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("getting MutatingWebhookConfiguration %q: %w", WebhookConfigName, err)
 	}
 
-	type webhookPatch struct {
-		Name     string `json:"name"`
-		CABundle []byte `json:"caBundle"`
-	}
-	type configPatch struct {
-		Webhooks []webhookPatch `json:"webhooks"`
+	// Build a JSON Patch that sets /webhooks/<i>/clientConfig/caBundle for each webhook.
+	type jsonPatchOp struct {
+		Op    string `json:"op"`
+		Path  string `json:"path"`
+		Value []byte `json:"value"`
 	}
 
-	p := configPatch{}
-	for _, wh := range wc.Webhooks {
-		p.Webhooks = append(p.Webhooks, webhookPatch{
-			Name:     wh.Name,
-			CABundle: caPEM,
+	var ops []jsonPatchOp
+	for i := range wc.Webhooks {
+		ops = append(ops, jsonPatchOp{
+			Op:    "replace",
+			Path:  fmt.Sprintf("/webhooks/%d/clientConfig/caBundle", i),
+			Value: caPEM,
 		})
 	}
 
-	patchBytes, err := json.Marshal(p)
+	patchBytes, err := json.Marshal(ops)
 	if err != nil {
-		return fmt.Errorf("marshalling caBundle patch: %w", err)
+		return fmt.Errorf("marshalling caBundle JSON patch: %w", err)
 	}
 
 	_, err = client.AdmissionregistrationV1().MutatingWebhookConfigurations().Patch(
 		ctx,
 		WebhookConfigName,
-		types.MergePatchType,
+		types.JSONPatchType,
 		patchBytes,
 		metav1.PatchOptions{},
 	)
