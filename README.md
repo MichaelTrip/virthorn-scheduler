@@ -62,8 +62,8 @@ The webhook intercepts **both** pod types:
 
 | Pod type | Trigger | Action |
 |---|---|---|
-| `virt-launcher` (any namespace) | `kubevirt.io/domain` label | Look up share-manager → inject nodeAffinity |
-| `share-manager-*` (`longhorn-system`) | `app=longhorn-share-manager` label | Look up opted-in virt-launcher → inject nodeAffinity |
+| `virt-launcher` (any namespace) | `kubevirt.io=virt-launcher` label | Look up share-manager → inject nodeAffinity |
+| `share-manager-*` (`longhorn-system`) | `longhorn.io/component=share-manager` label | Look up opted-in virt-launcher → inject nodeAffinity |
 
 ### Live migration
 
@@ -131,20 +131,23 @@ KubeVirt propagates annotations from the `VirtualMachine` template to the `virt-
 
 ### What gets injected
 
-When the webhook fires, it injects a `nodeAffinity` rule into `spec.affinity`:
+When the webhook fires, it injects a `nodeAffinity` rule into `spec.affinity`. The default mode is `preferred` (best-effort):
 
 ```yaml
 spec:
   affinity:
     nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-          - matchExpressions:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
               - key: kubernetes.io/hostname
                 operator: In
                 values:
                   - node-X   # the node where the share-manager is running
 ```
+
+With `--affinity-mode=required` (hard constraint), the injected rule uses `requiredDuringSchedulingIgnoredDuringExecution` instead — the pod stays `Pending` if the target node has resource pressure.
 
 Any existing `podAffinity` or `podAntiAffinity` rules on the pod are preserved. Only `nodeAffinity` is overwritten.
 
@@ -155,10 +158,11 @@ Any existing `podAffinity` or `podAntiAffinity` rules on the pod are preserved. 
 | Opt-in annotation key | `scheduler.virthorn-scheduler.io/co-schedule` |
 | Opt-in annotation value | `true` |
 | Migration target label | `kubevirt.io/migrationJobUID` |
-| virt-launcher detection label | `kubevirt.io/domain` |
+| virt-launcher detection label | `kubevirt.io=virt-launcher` (key `kubevirt.io`, value `virt-launcher`) |
 | Share-manager namespace | `longhorn-system` |
 | Share-manager pod name pattern | `share-manager-<pv-name>` |
-| Share-manager detection label | `app=longhorn-share-manager` |
+| Share-manager detection label | `longhorn.io/component=share-manager` |
+| Affinity mode | `preferred` (best-effort, default) or `required` (hard constraint) — set via `--affinity-mode` flag |
 | Webhook failure policy | `Ignore` (fail open — pods admitted normally if webhook is unavailable) |
 | TLS | Self-signed cert generated at startup, stored in `kube-system/virthorn-webhook-tls` Secret |
 
