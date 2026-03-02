@@ -1,0 +1,64 @@
+---
+# ClusterRole for the virthorn-webhook server.
+# Permissions needed:
+#   - Read pods (all namespaces) — to find virt-launcher pods using a PVC
+#   - Read PVCs (all namespaces) — to resolve PVC → PV name and check RWX
+#   - Read/write Secrets in kube-system — to store the self-signed TLS cert
+#   - Patch MutatingWebhookConfigurations — to update caBundle at startup
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: virthorn-webhook
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations"]
+    verbs: ["get", "patch"]
+
+---
+# ClusterRoleBinding: bind the ClusterRole to the webhook ServiceAccount.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: virthorn-webhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: virthorn-webhook
+subjects:
+  - kind: ServiceAccount
+    name: virthorn-webhook
+    namespace: kube-system
+
+---
+# Role: allow the webhook to manage the TLS Secret in kube-system.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: virthorn-webhook
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update"]
+
+---
+# RoleBinding: bind the Role to the webhook ServiceAccount.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: virthorn-webhook
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: virthorn-webhook
+subjects:
+  - kind: ServiceAccount
+    name: virthorn-webhook
+    namespace: kube-system

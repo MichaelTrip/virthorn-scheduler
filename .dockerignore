@@ -1,0 +1,19 @@
+# Git
+.git/
+.gitignore
+
+# CI / tooling
+.github/
+.golangci.yaml
+
+# Compiled output
+kubevirt-scheduler
+scheduler
+
+# Docs / plans
+README.md
+LICENSE
+plans/
+
+# Test files (not needed in image build)
+**/*_test.go
