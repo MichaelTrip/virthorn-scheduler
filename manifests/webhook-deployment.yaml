@@ -1,0 +1,85 @@
+---
+# ServiceAccount for the virthorn-webhook server.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: virthorn-webhook
+  namespace: kube-system
+
+---
+# Deployment for the virthorn-webhook server.
+# Runs on control-plane nodes for reliability.
+# The webhook server generates a self-signed TLS cert at startup and patches
+# the caBundle in the MutatingWebhookConfiguration automatically.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: virthorn-webhook
+  namespace: kube-system
+  labels:
+    app: virthorn-webhook
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: virthorn-webhook
+  template:
+    metadata:
+      labels:
+        app: virthorn-webhook
+    spec:
+      serviceAccountName: virthorn-webhook
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      priorityClassName: system-cluster-critical
+      containers:
+        - name: virthorn-webhook
+          image: ghcr.io/michaeltrip/virthorn-scheduler:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /virthorn-webhook
+            - --port=8443
+            - --service-name=virthorn-webhook
+            - --namespace=kube-system
+            - --affinity-mode=preferred   # "preferred" (best-effort) or "required" (hard constraint)
+            - --v=4
+          ports:
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault

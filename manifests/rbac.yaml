@@ -1,96 +1,64 @@
 ---
-# ServiceAccount for the kubevirt-scheduler
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: kubevirt-scheduler
-  namespace: kube-system
-
----
-# ClusterRole: extends the default kube-scheduler permissions with the
-# additional resources needed by the LonghornCoSchedule plugin.
+# ClusterRole for the virthorn-webhook server.
+# Permissions needed:
+#   - Read pods (all namespaces) — to find virt-launcher pods using a PVC
+#   - Read PVCs (all namespaces) — to resolve PVC → PV name and check RWX
+#   - Read/write Secrets in kube-system — to store the self-signed TLS cert
+#   - Patch MutatingWebhookConfigurations — to update caBundle at startup
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: kubevirt-scheduler
+  name: virthorn-webhook
 rules:
-  # --- Default kube-scheduler permissions ---
-  - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "delete"]
-  - apiGroups: [""]
-    resources: ["pods/binding"]
-    verbs: ["create"]
-  - apiGroups: [""]
-    resources: ["pods/status"]
-    verbs: ["patch", "update"]
-  - apiGroups: [""]
-    resources: ["replicationcontrollers", "services"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["apps", "extensions"]
-    resources: ["replicasets"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["apps"]
-    resources: ["statefulsets"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["policy"]
-    resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
-    resources: ["persistentvolumeclaims", "persistentvolumes"]
+    resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["storage.k8s.io"]
-    resources: ["storageclasses", "csinodes", "csidrivers", "csistoragecapacities", "volumeattachments"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "patch", "update"]
-  - apiGroups: ["events.k8s.io"]
-    resources: ["events"]
-    verbs: ["create", "patch", "update"]
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["create", "get", "list", "update"]
-  - apiGroups: [""]
-    resources: ["namespaces"]
-    verbs: ["get", "list", "watch"]
-
-  # --- LonghornCoSchedule plugin permissions ---
-  - apiGroups: ["longhorn.io"]
-    resources: ["sharemanagers"]
-    verbs: ["get"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations"]
+    verbs: ["get", "patch"]
 
 ---
-# ClusterRoleBinding: bind the ClusterRole to the ServiceAccount
+# ClusterRoleBinding: bind the ClusterRole to the webhook ServiceAccount.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: kubevirt-scheduler
+  name: virthorn-webhook
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: kubevirt-scheduler
+  name: virthorn-webhook
 subjects:
   - kind: ServiceAccount
-    name: kubevirt-scheduler
+    name: virthorn-webhook
     namespace: kube-system
 
 ---
-# RoleBinding: allow the scheduler to access the leader election ConfigMap/Lease
-# in kube-system (required for HA leader election).
+# Role: allow the webhook to manage the TLS Secret in kube-system.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: virthorn-webhook
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update"]
+
+---
+# RoleBinding: bind the Role to the webhook ServiceAccount.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: kubevirt-scheduler-leader-election
+  name: virthorn-webhook
   namespace: kube-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: extension-apiserver-authentication-reader
+  name: virthorn-webhook
 subjects:
   - kind: ServiceAccount
-    name: kubevirt-scheduler
+    name: virthorn-webhook
     namespace: kube-system

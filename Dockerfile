@@ -15,18 +15,18 @@ RUN go mod download
 # Copy all source (respects .dockerignore)
 COPY . .
 
-# Build the scheduler binary
+# Build the webhook binary
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w" \
-    -o /workspace/kubevirt-scheduler \
-    ./cmd/scheduler
+    -o /workspace/virthorn-webhook \
+    ./cmd/webhook
 
 # ---- Final stage ----
 # Use distroless for a minimal, secure image
 FROM gcr.io/distroless/static:nonroot
 
-COPY --from=builder /workspace/kubevirt-scheduler /kubevirt-scheduler
+COPY --from=builder /workspace/virthorn-webhook /virthorn-webhook
 
 USER 65532:65532
 
-ENTRYPOINT ["/kubevirt-scheduler"]
+ENTRYPOINT ["/virthorn-webhook"]
