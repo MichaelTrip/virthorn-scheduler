@@ -62,7 +62,9 @@ webhooks:
       caBundle: ""   # patched at startup by the webhook server
 
   # Rule 2: share-manager pods in longhorn-system.
-  # Longhorn sets app=longhorn-share-manager on share-manager pods.
+  # Longhorn sets longhorn.io/component=share-manager on share-manager pods.
+  # Note: Longhorn does NOT set app=longhorn-share-manager; the actual label is
+  # longhorn.io/component=share-manager.
   - name: share-manager.virthorn-webhook.io
     admissionReviewVersions: ["v1"]
     sideEffects: None
@@ -79,9 +81,9 @@ webhooks:
         kubernetes.io/metadata.name: longhorn-system
     objectSelector:
       matchExpressions:
-        - key: app
+        - key: longhorn.io/component
           operator: In
-          values: ["longhorn-share-manager"]
+          values: ["share-manager"]
     clientConfig:
       service:
         name: virthorn-webhook

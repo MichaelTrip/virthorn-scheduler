@@ -41,6 +41,14 @@ const (
 	// The full name is: share-manager-<pv-name>
 	ShareManagerPrefix = "share-manager-"
 
+	// ShareManagerLabelKey is the Longhorn label key set on share-manager pods.
+	// The actual label is longhorn.io/component=share-manager.
+	// Note: Longhorn does NOT set app=longhorn-share-manager.
+	ShareManagerLabelKey = "longhorn.io/component"
+
+	// ShareManagerLabelValue is the value of the longhorn.io/component label on share-manager pods.
+	ShareManagerLabelValue = "share-manager"
+
 	// MigrationTargetLabel is the KubeVirt label set on virt-launcher pods that
 	// are being created as the target of a live migration.
 	MigrationTargetLabel = "kubevirt.io/migrationJobUID"
@@ -451,7 +459,13 @@ func isVirtLauncher(pod *corev1.Pod) bool {
 }
 
 // isShareManager returns true if the pod is a Longhorn share-manager pod.
+// Longhorn sets longhorn.io/component=share-manager on all share-manager pods.
+// The pod name also always starts with "share-manager-<pv-name>" as a secondary check.
 func isShareManager(pod *corev1.Pod) bool {
+	if pod.Labels != nil && pod.Labels[ShareManagerLabelKey] == ShareManagerLabelValue {
+		return true
+	}
+	// Fallback: match by name prefix in case the label is absent.
 	return strings.HasPrefix(pod.Name, ShareManagerPrefix)
 }
 
