@@ -5,8 +5,7 @@
 
   **A Kubernetes mutating admission webhook that co-locates KubeVirt VM pods with their Longhorn RWX share-manager pods — eliminating cross-node NFS traffic.**
 
-  [![CI](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/ci.yaml/badge.svg)](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/ci.yaml)
-  [![Release](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/release.yaml/badge.svg)](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/release.yaml)
+  [![Release](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/build-release.yaml/badge.svg)](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/build-release.yaml)
   [![Go Report Card](https://goreportcard.com/badge/github.com/michaeltrip/virthorn-scheduler)](https://goreportcard.com/report/github.com/michaeltrip/virthorn-scheduler)
   [![Go version](https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
   [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
