@@ -110,7 +110,13 @@ func (h *Handler) Handle(ctx context.Context, req *admissionv1.AdmissionRequest)
 // handleVirtLauncher processes a virt-launcher pod admission request.
 // It injects nodeAffinity to co-locate the VM with its share-manager pod.
 func (h *Handler) handleVirtLauncher(ctx context.Context, req *admissionv1.AdmissionRequest, pod *corev1.Pod) *admissionv1.AdmissionResponse {
-	podKey := fmt.Sprintf("%s/%s", req.Namespace, pod.Name)
+	// Use pod.Namespace as the authoritative namespace — req.Namespace may be
+	// empty for cluster-scoped webhook configurations.
+	namespace := pod.Namespace
+	if namespace == "" {
+		namespace = req.Namespace
+	}
+	podKey := fmt.Sprintf("%s/%s", namespace, pod.Name)
 
 	// Check opt-in annotation.
 	if !isOptedIn(pod) {
@@ -128,7 +134,16 @@ func (h *Handler) handleVirtLauncher(ctx context.Context, req *admissionv1.Admis
 	}
 
 	// Find the share-manager node for any RWX PVC on this pod.
-	shareManagerNode, shareManagerPodName, err := h.findShareManagerForVirtLauncher(ctx, req.Namespace, pod)
+	// DIAGNOSTIC: log the namespace values to confirm req.Namespace vs pod.Namespace.
+	klog.V(2).InfoS("webhook/virt-launcher: namespace diagnostic",
+		"pod", podKey,
+		"req.Namespace", req.Namespace,
+		"pod.Namespace", pod.Namespace,
+		"namespace(used)", namespace,
+		"isOptedIn", isOptedIn(pod),
+		"annotations", pod.Annotations,
+	)
+	shareManagerNode, shareManagerPodName, err := h.findShareManagerForVirtLauncher(ctx, namespace, pod)
 	if err != nil {
 		klog.ErrorS(err, "webhook/virt-launcher: error looking up share-manager", "pod", podKey)
 		// Fail open: allow the pod without affinity rather than blocking it.
@@ -169,6 +184,13 @@ func (h *Handler) handleShareManager(ctx context.Context, req *admissionv1.Admis
 		return allow(req.UID)
 	}
 
+	// DIAGNOSTIC: log what we know about the share-manager pod before lookup.
+	klog.V(2).InfoS("webhook/share-manager: starting virt-launcher lookup",
+		"pod", podKey,
+		"pvName", pvName,
+		"req.Namespace", req.Namespace,
+		"pod.Namespace", pod.Namespace,
+	)
 	// Find the opted-in virt-launcher pod that uses this PV.
 	virtLauncherNode, virtLauncherPodName, err := h.findVirtLauncherForPV(ctx, pvName)
 	if err != nil {
@@ -288,6 +310,20 @@ func (h *Handler) findVirtLauncherForPV(ctx context.Context, pvName string) (str
 
 	for i := range podList.Items {
 		p := &podList.Items[i]
+		pKey := fmt.Sprintf("%s/%s", p.Namespace, p.Name)
+
+		// DIAGNOSTIC: log every candidate pod's state.
+		klog.V(2).InfoS("webhook/findVirtLauncherForPV: evaluating candidate pod",
+			"pod", pKey,
+			"phase", p.Status.Phase,
+			"nodeName", p.Spec.NodeName,
+			"isVirtLauncher", isVirtLauncher(p),
+			"isOptedIn", isOptedIn(p),
+			"isMigrationTarget", isMigrationTarget(p),
+			"usesPVC", podUsesPVC(p, pvcName),
+			"annotations", p.Annotations,
+			"labels", p.Labels,
+		)
 
 		// Must be a virt-launcher pod.
 		if !isVirtLauncher(p) {
@@ -295,6 +331,7 @@ func (h *Handler) findVirtLauncherForPV(ctx context.Context, pvName string) (str
 		}
 		// Must be opted in.
 		if !isOptedIn(p) {
+			klog.V(2).InfoS("webhook/findVirtLauncherForPV: pod not opted in, skipping", "pod", pKey, "annotations", p.Annotations)
 			continue
 		}
 		// Must not be a migration target.
@@ -305,15 +342,20 @@ func (h *Handler) findVirtLauncherForPV(ctx context.Context, pvName string) (str
 		if !podUsesPVC(p, pvcName) {
 			continue
 		}
-		// Must be running on a node.
+		// Must be scheduled to a node (NodeName set by scheduler, even if not yet Running).
 		if p.Spec.NodeName == "" {
 			klog.V(4).InfoS("webhook: virt-launcher pod found but not yet scheduled",
-				"pod", fmt.Sprintf("%s/%s", p.Namespace, p.Name),
+				"pod", pKey,
 			)
 			continue
 		}
 
-		return p.Spec.NodeName, fmt.Sprintf("%s/%s", p.Namespace, p.Name), nil
+		klog.V(2).InfoS("webhook/findVirtLauncherForPV: found matching virt-launcher",
+			"pod", pKey,
+			"nodeName", p.Spec.NodeName,
+			"phase", p.Status.Phase,
+		)
+		return p.Spec.NodeName, pKey, nil
 	}
 
 	klog.V(4).InfoS("webhook: no running opted-in virt-launcher found for PVC",
