@@ -3,7 +3,7 @@
 
   # virthorn-scheduler
 
-  **A custom Kubernetes scheduler that co-locates KubeVirt VM pods with their Longhorn RWX share-manager pods — eliminating cross-node NFS traffic.**
+  **A Kubernetes mutating admission webhook that co-locates KubeVirt VM pods with their Longhorn RWX share-manager pods — eliminating cross-node NFS traffic.**
 
   [![CI](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/ci.yaml/badge.svg)](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/ci.yaml)
   [![Release](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/release.yaml/badge.svg)](https://github.com/michaeltrip/virthorn-scheduler/actions/workflows/release.yaml)
@@ -18,62 +18,56 @@
 
 ---
 
-
 ## Problem
 
 When KubeVirt VMs use Longhorn RWX volumes, Longhorn creates a `share-manager` pod (NFS server) per PVC in the `longhorn-system` namespace. By default this pod is scheduled independently of the VM, causing NFS traffic to cross node boundaries — adding latency and network overhead.
 
 ## Solution
 
-`virthorn-scheduler` is a custom Kubernetes scheduler built with the [Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/). It implements two extension points:
+`virthorn-scheduler` is a **mutating admission webhook** that injects `nodeAffinity` rules into pods at creation time, co-locating:
 
-| Plugin | Behaviour |
-|---|---|
-| **Filter** | If a share-manager is assigned for the VM's PVC, only the node where it runs passes the filter |
-| **Score** | The share-manager's node receives the maximum score (100); all others receive 0 |
+- **virt-launcher pods** → pinned to the node where the share-manager is already running
+- **share-manager pods** → pinned to the node where the opted-in virt-launcher is already running
 
-The scheduler is **opt-in** via a pod annotation — only pods that explicitly request it are affected.
+Whichever pod is created second gets the affinity pointing to the first. The standard `kube-scheduler` then honors the injected affinity — no custom scheduler binary needed.
 
 ## How It Works
 
 ```
-VM Pod created
+VM Pod created (virt-launcher)
   │
-  ├─ No annotation → default scheduling (no-op)
+  ├─ No co-schedule annotation → pass through unchanged
   │
-  ├─ Migration target pod (kubevirt.io/migrationJobUID set)
-  │    └─ Plugin is a no-op — KubeVirt migration controller
-  │       handles node selection via node affinity
+  ├─ migrationJobUID label set (live migration target)
+  │    └─ pass through unchanged — KubeVirt migration controller handles placement
   │
   └─ annotation scheduler.virthorn-scheduler.io/co-schedule: "true"
        │
-       ├─ WARM RESTART: Longhorn Volume CRD spec.nodeID = "node-X"
-       │    (volume was attached before — Longhorn persists the node)
-       │    └─ Filter: only node-X passes
-       │       Score: node-X gets score 100
+       ├─ Share-manager pod already running on node-X
+       │    └─ Inject nodeAffinity: require kubernetes.io/hostname = node-X
        │       → VM scheduled on node-X ✅ co-located
        │
-       └─ COLD START: Longhorn Volume CRD spec.nodeID = ""
-            (brand-new PVC, never attached before)
-            └─ Plugin queries Replica CRDs for this volume
-               Finds healthy replica node ≠ ownerID  ← Longhorn's engine node
-               Filter: only that node passes
-               Score: that node gets score 100
-               → VM scheduled on predicted engine node ✅ co-located
+       └─ No share-manager pod yet
+            └─ Pass through unchanged
+               When share-manager is created later:
+               └─ Webhook finds virt-launcher running on node-Y
+                  Inject nodeAffinity: require kubernetes.io/hostname = node-Y
+                  → Share-manager scheduled on node-Y ✅ co-located
+
 ```
 
-### Share-manager node discovery
+### Bidirectional co-location
 
-The plugin reads the **Longhorn Volume CRD** (`volumes.longhorn.io/v1beta2`) and **Longhorn Replica CRDs** (`replicas.longhorn.io/v1beta2`) to determine where the volume engine will run:
+The webhook intercepts **both** pod types:
 
-1. **`spec.nodeID`** (warm restart) — set by Longhorn after the first attachment; Longhorn always re-attaches to this node. Authoritative for subsequent VM starts.
-2. **`status.currentNodeID`** — identical to `spec.nodeID` when attached; belt-and-suspenders fallback.
-3. **Replica CRD heuristic** (cold start) — when both of the above are empty (brand-new volume, never attached), the plugin lists all Longhorn Replica CRDs for this volume, finds a healthy replica on a node **other than `status.ownerID`**, and uses that as the predicted attachment node. This reflects Longhorn's observed behaviour: the engine is always placed on a non-ownerID replica node.
-4. **Share-manager pod `spec.nodeName`** — final fallback; only useful if the share-manager pod is already `Running`.
+| Pod type | Trigger | Action |
+|---|---|---|
+| `virt-launcher` (any namespace) | `kubevirt.io/domain` label | Look up share-manager → inject nodeAffinity |
+| `share-manager-*` (`longhorn-system`) | `app=longhorn-share-manager` label | Look up opted-in virt-launcher → inject nodeAffinity |
 
 ### Live migration
 
-When `virtctl migrate` is used, KubeVirt creates a new **target virt-launcher pod** and sets the label `kubevirt.io/migrationJobUID` on it. The plugin detects this label and becomes a **no-op** for migration target pods — the KubeVirt migration controller already selects the destination node via pod node affinity, and constraining it to the share-manager node would break migration.
+When `virtctl migrate` is used, KubeVirt creates a new **target virt-launcher pod** and sets the label `kubevirt.io/migrationJobUID` on it. The webhook detects this label and **passes the pod through unchanged** — the KubeVirt migration controller already selects the destination node via node affinity, and constraining it to the share-manager node would break migration.
 
 ## Installation
 
@@ -84,27 +78,34 @@ docker build -t ghcr.io/<your-org>/virthorn-scheduler:latest .
 docker push ghcr.io/<your-org>/virthorn-scheduler:latest
 ```
 
-Update the `image:` field in [`manifests/deployment.yaml`](manifests/deployment.yaml) to match.
+Update the `image:` field in [`manifests/webhook-deployment.yaml`](manifests/webhook-deployment.yaml) to match.
 
 ### 2. Apply the manifests
 
 ```bash
+# Apply in order: RBAC first, then webhook config, then deployment
 kubectl apply -f manifests/rbac.yaml
-kubectl apply -f manifests/scheduler-config.yaml
-kubectl apply -f manifests/deployment.yaml
+kubectl apply -f manifests/webhook.yaml
+kubectl apply -f manifests/webhook-deployment.yaml
 ```
 
-### 3. Verify the scheduler is running
+The webhook server will:
+1. Generate a self-signed TLS certificate at startup
+2. Store it in the `virthorn-webhook-tls` Secret in `kube-system`
+3. Patch the `caBundle` field in the `MutatingWebhookConfiguration` automatically
+
+### 3. Verify the webhook is running
 
 ```bash
-kubectl -n kube-system get pods -l app=virthorn-scheduler
+kubectl -n kube-system get pods -l app=virthorn-webhook
+kubectl -n kube-system logs -l app=virthorn-webhook
 ```
 
 ## Usage
 
 ### Opt-in a VirtualMachine
 
-Add the annotation and set `schedulerName` in your `VirtualMachine` spec:
+Add **only** the annotation to your `VirtualMachine` spec. No custom `schedulerName` is needed — the standard `kube-scheduler` handles scheduling after the webhook injects the affinity.
 
 ```yaml
 apiVersion: kubevirt.io/v1
@@ -117,7 +118,7 @@ spec:
       annotations:
         scheduler.virthorn-scheduler.io/co-schedule: "true"   # opt-in to co-scheduling
     spec:
-      schedulerName: virthorn-scheduler           # use our custom scheduler
+      # schedulerName is NOT needed — use the default kube-scheduler
       domain:
         # ... your VM spec ...
       volumes:
@@ -126,35 +127,26 @@ spec:
             claimName: my-rwx-pvc                # must be a Longhorn RWX PVC
 ```
 
-KubeVirt propagates annotations from the `VirtualMachine` template to the `virt-launcher` pod automatically.
+KubeVirt propagates annotations from the `VirtualMachine` template to the `virt-launcher` pod automatically. The webhook reads the annotation there.
 
-### How share-manager pods are discovered
+### What gets injected
 
-Longhorn names share-manager pods after the **PV name** (which equals the PVC UID for dynamically provisioned volumes):
+When the webhook fires, it injects a `nodeAffinity` rule into `spec.affinity`:
 
+```yaml
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                  - node-X   # the node where the share-manager is running
 ```
-longhorn-system/share-manager-pvc-<uuid>
-```
 
-The plugin runs in two phases:
-
-**Filter & Score phase** (before the virt-launcher pod is bound):
-1. Lists all PVCs referenced by the VM pod
-2. Checks each PVC is `ReadWriteMany`
-3. Resolves the PV name from `pvc.spec.volumeName`
-4. Reads the **Longhorn Volume CRD** (`volumes.longhorn.io`) `spec.nodeID` — the node Longhorn last attached the engine to (set after first attachment, authoritative for warm restarts)
-5. Falls back to `status.currentNodeID` (same value when attached)
-6. Falls back to checking the running `share-manager-<pv-name>` pod `spec.nodeName`
-7. If no node is found (cold start — first ever use of this PVC), Filter and Score are no-ops
-
-**PostBind phase** (after the virt-launcher pod is bound, cold start only):
-1. If the Longhorn Volume CRD `spec.nodeID` was empty, patches it to the node the virt-launcher was just bound to
-2. Longhorn reads `spec.nodeID` when attaching the volume engine and co-locates the share-manager pod there
-3. On warm restarts (`spec.nodeID` already set), PostBind is a no-op
-
-### Live migration behaviour
-
-Migration target pods are identified by the label `kubevirt.io/migrationJobUID` (set by KubeVirt to the UID of the `VirtualMachineInstanceMigration` object). The plugin skips both Filter and Score for these pods, allowing the KubeVirt migration controller to place the target pod freely.
+Any existing `podAffinity` or `podAntiAffinity` rules on the pod are preserved. Only `nodeAffinity` is overwritten.
 
 ## Configuration
 
@@ -162,92 +154,69 @@ Migration target pods are identified by the label `kubevirt.io/migrationJobUID` 
 |---|---|
 | Opt-in annotation key | `scheduler.virthorn-scheduler.io/co-schedule` |
 | Opt-in annotation value | `true` |
-| Scheduler name | `virthorn-scheduler` |
-| Share-manager namespace | `longhorn-system` |
-| Longhorn Volume CRD | `volumes.longhorn.io/v1beta2` |
-| Longhorn Replica CRD | `replicas.longhorn.io/v1beta2` |
-| Share-manager pod name pattern | `share-manager-<pv-name>` |
 | Migration target label | `kubevirt.io/migrationJobUID` |
+| virt-launcher detection label | `kubevirt.io/domain` |
+| Share-manager namespace | `longhorn-system` |
+| Share-manager pod name pattern | `share-manager-<pv-name>` |
+| Share-manager detection label | `app=longhorn-share-manager` |
+| Webhook failure policy | `Ignore` (fail open — pods admitted normally if webhook is unavailable) |
+| TLS | Self-signed cert generated at startup, stored in `kube-system/virthorn-webhook-tls` Secret |
 
 ## Debugging / Logging
 
-The plugin emits structured log messages using `klog` at verbosity level **4** (`V(4)`). The default deployment ships with `--v=4` so plugin decisions are visible out of the box.
+The webhook emits structured log messages using `klog` at verbosity level **4** (`V(4)`). The default deployment ships with `--v=4`.
 
-### Enabling / changing verbosity
-
-The verbosity flag is set in [`manifests/deployment.yaml`](manifests/deployment.yaml):
-
-```yaml
-command:
-  - /virthorn-scheduler
-  - --config=/etc/kubernetes/scheduler/scheduler-config.yaml
-  - --v=4   # change to 2 for quieter output, 5 for trace-level
-```
-
-To change it on a running cluster without redeploying:
+### Tailing the webhook logs
 
 ```bash
-kubectl -n kube-system patch deployment virthorn-scheduler --type=json \
-  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/command/2","value":"--v=4"}]'
+kubectl -n kube-system logs -l app=virthorn-webhook -f
 ```
 
 ### What gets logged
 
 | Verbosity | Message |
 |---|---|
-| `V(4)` | Migration target pod detected — plugin skipped (includes `migrationJobUID`) |
-| `V(4)` | No share-manager found — all nodes pass / score 0 |
-| `V(4)` | Node accepted — share-manager co-located on same node |
-| `V(4)` | Node rejected — share-manager on a different node |
-| `V(4)` | Score assigned — max (100) or 0, with reason |
-| `V(4)` | Cold start — predicted attachment node from Replica CRDs (non-ownerID replica) |
-| `V(4)` | Cold start — no usable replicas found, VM schedules freely |
-| `V(5)` | Pod not opted in — plugin skipped |
-| `ErrorS` | Share-manager lookup failed (API error) |
+| `V(4)` | Migration target pod detected — webhook skipped |
+| `V(4)` | No share-manager found yet — no affinity injected |
+| `V(4)` | Injecting nodeAffinity to co-locate with share-manager (includes node name) |
+| `V(4)` | Injecting nodeAffinity to co-locate with virt-launcher (includes node name) |
+| `V(4)` | No opted-in virt-launcher found — no affinity injected |
+| `V(5)` | Pod not opted in — webhook skipped |
+| `ErrorS` | API lookup failed (logged as warning; pod is admitted without affinity) |
 
 ### Example log output
 
 **VM scheduled on share-manager node:**
 ```
-LonghornCoSchedule/Filter: node accepted (share-manager co-located)  pod=virtualmachines/virt-launcher-my-vm-xxxxx node=virt01 shareManagerNode=virt01
-LonghornCoSchedule/Score: node matches share-manager, scoring max    pod=... node=virt01 shareManagerNode=virt01 score=100
-LonghornCoSchedule/Score: node does not match share-manager, scoring 0  pod=... node=virt02 shareManagerNode=virt01
+webhook/virt-launcher: injecting nodeAffinity to co-locate with share-manager  pod=default/virt-launcher-my-vm-xxxxx shareManagerPod=share-manager-pvc-abc123 shareManagerNode=node-1
 ```
 
-**Node rejected (wrong node):**
+**Share-manager co-located with running VM:**
 ```
-LonghornCoSchedule/Filter: node rejected (share-manager on different node)  pod=... node=virt02 shareManagerNode=virt01
+webhook/share-manager: injecting nodeAffinity to co-locate with virt-launcher  pod=longhorn-system/share-manager-pvc-abc123 pvName=pvc-abc123 virtLauncherPod=default/virt-launcher-my-vm-xxxxx virtLauncherNode=node-1
 ```
 
-**Live migration target (plugin bypassed):**
+**Live migration target (webhook bypassed):**
 ```
-LonghornCoSchedule/Filter: migration target pod, skipping (KubeVirt migration controller handles placement)  pod=... migrationJobUID=08b02237-4ab6-493b-a4e0-c90e5e940a47
-LonghornCoSchedule/Score: migration target pod, skipping (KubeVirt migration controller handles placement)   pod=... node=virt02 migrationJobUID=08b02237-4ab6-493b-a4e0-c90e5e940a47
+webhook/virt-launcher: migration target pod, skipping  pod=default/virt-launcher-my-vm-yyyyy migrationJobUID=08b02237-4ab6-493b-a4e0-c90e5e940a47
 ```
 
 **No share-manager yet (free scheduling):**
 ```
-LonghornCoSchedule/Filter: no share-manager found, all nodes pass  pod=... node=virt01
-LonghornCoSchedule/Score: no share-manager found, scoring 0        pod=... node=virt01
-```
-
-### Tailing the scheduler logs
-
-```bash
-kubectl -n kube-system logs -l app=virthorn-scheduler -f | grep LonghornCoSchedule
+webhook/virt-launcher: no share-manager found yet, no affinity injected  pod=default/virt-launcher-my-vm-xxxxx
 ```
 
 ## Development
 
 ### Prerequisites
 
-- Go 1.24+
+- Go 1.23+
 - Access to a Kubernetes cluster with KubeVirt and Longhorn installed
 
 ### Build
 
 ```bash
-go build -o virthorn-scheduler ./cmd/scheduler
+go build -o virthorn-webhook ./cmd/webhook
 ```
 
 ### Test
@@ -260,17 +229,14 @@ go test ./pkg/...
 
 ```
 virthorn-scheduler/
-├── cmd/scheduler/main.go                        # Entry point
-├── pkg/plugins/longhorn_cosched/
-│   ├── plugin.go                                # Plugin registration, constants & helpers
-│   ├── filter.go                                # Filter extension point
-│   ├── score.go                                 # Score extension point
-│   ├── sharemanager.go                          # ShareManager CRD + pod lookup
-│   └── plugin_test.go                           # Unit tests
+├── cmd/webhook/main.go              # Entry point — HTTPS server, /mutate + /healthz
+├── pkg/webhook/
+│   ├── handler.go                   # Webhook logic — pod type detection, affinity injection
+│   └── tls.go                       # Self-signed TLS bootstrap
 ├── manifests/
-│   ├── rbac.yaml                                # RBAC permissions
-│   ├── scheduler-config.yaml                    # KubeSchedulerConfiguration
-│   └── deployment.yaml                          # Scheduler Deployment
+│   ├── rbac.yaml                    # ServiceAccount, ClusterRole, Role, bindings
+│   ├── webhook.yaml                 # MutatingWebhookConfiguration + Service
+│   └── webhook-deployment.yaml      # Deployment + ServiceAccount
 └── Dockerfile
 ```
 

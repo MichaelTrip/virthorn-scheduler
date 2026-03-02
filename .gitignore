@@ -1,5 +1,7 @@
 # Compiled binaries
 kubevirt-scheduler
+virthorn-scheduler
+virthorn-webhook
 /scheduler
 
 # Go build cache
