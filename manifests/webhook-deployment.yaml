@@ -38,7 +38,7 @@ spec:
       priorityClassName: system-cluster-critical
       containers:
         - name: virthorn-webhook
-          image: ghcr.io/michaeltrip/virthorn-scheduler:latest
+          image: ghcr.io/michaeltrip/virthorn-scheduler:v1.0.0
           imagePullPolicy: IfNotPresent
           command:
             - /virthorn-webhook
