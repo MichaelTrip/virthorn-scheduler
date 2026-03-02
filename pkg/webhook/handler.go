@@ -43,8 +43,12 @@ const (
 	// are being created as the target of a live migration.
 	MigrationTargetLabel = "kubevirt.io/migrationJobUID"
 
-	// VirtLauncherLabel is the label KubeVirt sets on all virt-launcher pods.
-	VirtLauncherLabel = "kubevirt.io/domain"
+	// VirtLauncherLabel is the label key KubeVirt sets on all virt-launcher pods.
+	// The actual label is kubevirt.io=virt-launcher (key="kubevirt.io", value="virt-launcher").
+	VirtLauncherLabel = "kubevirt.io"
+
+	// VirtLauncherLabelValue is the value of the kubevirt.io label on virt-launcher pods.
+	VirtLauncherLabelValue = "virt-launcher"
 )
 
 // AffinityMode controls whether the injected nodeAffinity is hard (required)
@@ -273,8 +277,11 @@ func (h *Handler) findVirtLauncherForPV(ctx context.Context, pvName string) (str
 	}
 
 	// Find virt-launcher pods in that namespace that use this PVC.
-	// KubeVirt sets kubevirt.io/domain on all virt-launcher pods.
-	podList, err := h.client.CoreV1().Pods(pvcNamespace).List(ctx, metav1.ListOptions{})
+	// KubeVirt sets kubevirt.io=virt-launcher on all virt-launcher pods.
+	// Use a label selector to limit the list to virt-launcher pods only.
+	podList, err := h.client.CoreV1().Pods(pvcNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", VirtLauncherLabel, VirtLauncherLabelValue),
+	})
 	if err != nil {
 		return "", "", fmt.Errorf("listing pods in namespace %q: %w", pvcNamespace, err)
 	}
@@ -405,13 +412,12 @@ func buildAffinity(existing *corev1.Affinity, nodeName string, mode AffinityMode
 }
 
 // isVirtLauncher returns true if the pod is a KubeVirt virt-launcher pod.
-// KubeVirt sets the label "kubevirt.io/domain" on all virt-launcher pods.
+// KubeVirt sets the label kubevirt.io=virt-launcher on all virt-launcher pods.
 func isVirtLauncher(pod *corev1.Pod) bool {
 	if pod.Labels == nil {
 		return false
 	}
-	_, ok := pod.Labels[VirtLauncherLabel]
-	return ok
+	return pod.Labels[VirtLauncherLabel] == VirtLauncherLabelValue
 }
 
 // isShareManager returns true if the pod is a Longhorn share-manager pod.

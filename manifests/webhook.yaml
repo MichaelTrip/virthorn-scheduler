@@ -35,7 +35,8 @@ metadata:
     app: virthorn-webhook
 webhooks:
   # Rule 1: virt-launcher pods in any namespace.
-  # KubeVirt sets the label kubevirt.io/domain on all virt-launcher pods.
+  # KubeVirt sets the label kubevirt.io=virt-launcher on all virt-launcher pods.
+  # Note: the label key is "kubevirt.io" (not "kubevirt.io/domain").
   - name: virt-launcher.virthorn-webhook.io
     admissionReviewVersions: ["v1"]
     sideEffects: None
@@ -49,8 +50,9 @@ webhooks:
         scope: Namespaced
     objectSelector:
       matchExpressions:
-        - key: kubevirt.io/domain
-          operator: Exists
+        - key: kubevirt.io
+          operator: In
+          values: ["virt-launcher"]
     clientConfig:
       service:
         name: virthorn-webhook
