@@ -276,10 +276,10 @@ jobs:
 
       - name: Update deployment manifest with new image tag
         run: |
-          echo "🔄 Updating manifests/deployment.yaml to use new image tag..."
+          echo "🔄 Updating manifests/webhook-deployment.yaml to use new image tag..."
 
           NEW_IMAGE="ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.determine-tag.outputs.docker-tag }}"
-          sed -i "s|image: ghcr\.io/michaeltrip/virthorn-scheduler:.*|image: ${NEW_IMAGE}|g" manifests/deployment.yaml
+          sed -i "s|image: ghcr\.io/michaeltrip/virthorn-scheduler:.*|image: ${NEW_IMAGE}|g" manifests/webhook-deployment.yaml
 
           if git diff --quiet; then
             echo "✅ Deployment file is already up to date"
@@ -290,7 +290,7 @@ jobs:
 
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add manifests/deployment.yaml
+          git add manifests/webhook-deployment.yaml
           git commit -m "chore: update deployment image to ${{ needs.determine-tag.outputs.docker-tag }}
 
           Auto-generated from workflow run: ${{ github.run_id }}"
